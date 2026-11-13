@@ -195,7 +195,7 @@ export interface AuthenticatedRequest extends Request {
 
 export function createAuthMiddleware(db: Database.Database) {
   const getUserStmt = db.prepare(`
-    SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt
+    SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
     FROM users
     WHERE id = ?
   `);
@@ -216,8 +216,8 @@ export function createAuthMiddleware(db: Database.Database) {
       return;
     }
 
-    const row = getUserStmt.get(payload.userId) as UserPublic | undefined;
-    req.user = row || null;
+    const row = getUserStmt.get(payload.userId) as (UserPublic & { isDemo?: number | boolean }) | undefined;
+    req.user = row ? { ...row, isDemo: Boolean(row.isDemo) } : null;
     next();
   }
 

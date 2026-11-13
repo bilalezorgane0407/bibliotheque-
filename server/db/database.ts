@@ -31,7 +31,8 @@ export function initSchema(db: Database.Database): void {
       accountStatus TEXT NOT NULL CHECK (accountStatus IN ('actif', 'suspendu')),
       cne TEXT,
       filiere TEXT,
-      authSource TEXT NOT NULL DEFAULT 'local' CHECK (authSource IN ('local', 'usmba_sso')),
+      authSource TEXT NOT NULL DEFAULT 'local' CHECK (authSource IN ('local', 'usmba_sso', 'google_oidc')),
+      isDemo INTEGER NOT NULL DEFAULT 0,
       createdAt TEXT NOT NULL
     );
 
@@ -50,6 +51,7 @@ export function initSchema(db: Database.Database): void {
       shelfLocation TEXT NOT NULL,
       archived INTEGER NOT NULL DEFAULT 0,
       featured INTEGER NOT NULL DEFAULT 0,
+      isDemo INTEGER NOT NULL DEFAULT 0,
       createdAt TEXT NOT NULL
     );
 
@@ -83,7 +85,7 @@ export function initSchema(db: Database.Database): void {
       bookId TEXT NOT NULL REFERENCES books(id),
       requestedAt TEXT NOT NULL,
       queuePosition INTEGER,
-      status TEXT NOT NULL CHECK (status IN ('En attente', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
+      status TEXT NOT NULL CHECK (status IN ('En attente', 'Exemplaire attribué', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
       assignedCopyId TEXT REFERENCES copies(id),
       availableAt TEXT,
       pickupDeadline TEXT,
@@ -100,12 +102,133 @@ export function initSchema(db: Database.Database): void {
       readAt TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS cart_items (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      bookId TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity >= 1),
+      addedAt TEXT NOT NULL,
+      UNIQUE (userId, bookId)
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      actorId TEXT,
+      actorName TEXT,
+      actorRole TEXT,
+      action TEXT NOT NULL,
+      entityType TEXT NOT NULL,
+      entityId TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      createdAt TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_copies_book_status ON copies(bookId, status);
     CREATE INDEX IF NOT EXISTS idx_loans_member_status ON loans(memberId, status);
     CREATE INDEX IF NOT EXISTS idx_loans_copy_status ON loans(copyId, status);
     CREATE INDEX IF NOT EXISTS idx_reservations_book_status_req ON reservations(bookId, status, requestedAt);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, createdAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_cart_items_user ON cart_items(userId, addedAt ASC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(createdAt DESC);
   `);
+
+  migrateExistingSchemaIfNeeded(db);
+}
+
+function migrateExistingSchemaIfNeeded(db: Database.Database): void {
+  const usersSqlRow = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'`)
+    .get() as { sql?: string } | undefined;
+  const usersCols = db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
+  const hasUserIsDemo = usersCols.some((c) => c.name === 'isDemo');
+  const hasGoogleOidcCheck = Boolean(usersSqlRow?.sql?.includes('google_oidc'));
+
+  if (!hasUserIsDemo || !hasGoogleOidcCheck) {
+    db.pragma('foreign_keys = OFF');
+    const migrateUsers = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE users_migrated (
+          id TEXT PRIMARY KEY,
+          fullName TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE,
+          passwordHash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('membre', 'bibliothecaire')),
+          institution TEXT NOT NULL,
+          studentStatus TEXT NOT NULL CHECK (studentStatus IN ('verifie', 'en_attente', 'non_est', 'suspendu')),
+          accountStatus TEXT NOT NULL CHECK (accountStatus IN ('actif', 'suspendu')),
+          cne TEXT,
+          filiere TEXT,
+          authSource TEXT NOT NULL DEFAULT 'local' CHECK (authSource IN ('local', 'usmba_sso', 'google_oidc')),
+          isDemo INTEGER NOT NULL DEFAULT 0,
+          createdAt TEXT NOT NULL
+        );
+      `);
+      const selectDemoExpr = hasUserIsDemo ? 'isDemo' : `CASE WHEN authSource = 'local' THEN 1 ELSE 0 END`;
+      db.exec(`
+        INSERT INTO users_migrated (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt)
+        SELECT id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, ${selectDemoExpr}, createdAt
+        FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_migrated RENAME TO users;
+      `);
+    });
+    migrateUsers();
+    db.pragma('foreign_keys = ON');
+  }
+
+  // Remplacer toute donnée personnelle ou adresse seed héritée par les profils fictifs explicites
+  const demoUpdates: Array<[string, string, string]> = [
+    ['usr-salma', 'Salma Idrissi (Démo)', 'salma.demo@usmba.example'],
+    ['usr-bilale', 'Amine El Fassi (Démo)', 'amine.demo@usmba.example'],
+    ['usr-youssef', 'Youssef Mansouri (Démo)', 'youssef.demo@usmba.example'],
+    ['usr-karim', 'Karim Berrada (Démo)', 'karim.demo@usmba.example'],
+    ['usr-lib', 'Nadia Benali (Démo)', 'bibliothecaire.demo@est-usmba.example'],
+  ];
+  const updateDemoStmt = db.prepare(
+    `UPDATE users SET fullName = ?, email = ?, isDemo = 1 WHERE id = ? AND authSource = 'local'`
+  );
+  for (const [id, fullName, email] of demoUpdates) {
+    updateDemoStmt.run(fullName, email, id);
+  }
+
+  const booksCols = db.prepare(`PRAGMA table_info(books)`).all() as Array<{ name: string }>;
+  if (!booksCols.some((c) => c.name === 'isDemo')) {
+    db.exec(`ALTER TABLE books ADD COLUMN isDemo INTEGER NOT NULL DEFAULT 0`);
+    db.prepare(
+      `UPDATE books SET isDemo = 1 WHERE id IN ('bk-algo', 'bk-sys-dist', 'bk-auto', 'bk-elec-puiss', 'bk-comptabilite', 'bk-meca', 'bk-maths')`
+    ).run();
+  }
+
+  const resSqlRow = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reservations'`)
+    .get() as { sql?: string } | undefined;
+  if (resSqlRow?.sql && !resSqlRow.sql.includes('Exemplaire attribué')) {
+    db.pragma('foreign_keys = OFF');
+    const migrateRes = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE reservations_migrated (
+          id TEXT PRIMARY KEY,
+          memberId TEXT NOT NULL REFERENCES users(id),
+          bookId TEXT NOT NULL REFERENCES books(id),
+          requestedAt TEXT NOT NULL,
+          queuePosition INTEGER,
+          status TEXT NOT NULL CHECK (status IN ('En attente', 'Exemplaire attribué', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
+          assignedCopyId TEXT REFERENCES copies(id),
+          availableAt TEXT,
+          pickupDeadline TEXT,
+          completedAt TEXT
+        );
+        INSERT INTO reservations_migrated (id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
+        SELECT id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt
+        FROM reservations;
+        DROP TABLE reservations;
+        ALTER TABLE reservations_migrated RENAME TO reservations;
+        CREATE INDEX IF NOT EXISTS idx_reservations_book_status_req ON reservations(bookId, status, requestedAt);
+      `);
+    });
+    migrateRes();
+    db.pragma('foreign_keys = ON');
+  }
 }
 
 export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new Date()): void {
@@ -118,75 +241,78 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
 
   const seed = db.transaction(() => {
     const insertUser = db.prepare(`
-      INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt)
-      VALUES (@id, @fullName, @email, @passwordHash, @role, @institution, @studentStatus, @accountStatus, @cne, @filiere, @authSource, @createdAt)
+      INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt)
+      VALUES (@id, @fullName, @email, @passwordHash, @role, @institution, @studentStatus, @accountStatus, @cne, @filiere, @authSource, @isDemo, @createdAt)
     `);
 
-    const studentHash = hashPassword('EtudiantEST2026!');
-    const librarianHash = hashPassword('BiblioAdmin2026!');
+    const demoLocalHash = hashPassword('DemoBiblioEST2026!');
 
     const users = [
       {
         id: 'usr-salma',
-        fullName: 'Salma Bennani',
-        email: 'salma.bennani@usmba.ac.ma',
-        passwordHash: studentHash,
+        fullName: 'Salma Idrissi (Démo)',
+        email: 'salma.demo@usmba.example',
+        passwordHash: demoLocalHash,
         role: 'membre',
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
-        cne: 'N134089211',
+        cne: 'DEMO-N001',
         filiere: 'Génie Informatique',
         authSource: 'local',
+        isDemo: 1,
         createdAt: isoOffset(-60),
       },
       {
         id: 'usr-bilale',
-        fullName: 'Bilale Zorgane',
-        email: 'bilale.zorgane@usmba.ac.ma',
-        passwordHash: studentHash,
+        fullName: 'Amine El Fassi (Démo)',
+        email: 'amine.demo@usmba.example',
+        passwordHash: demoLocalHash,
         role: 'membre',
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
-        cne: 'N139845120',
+        cne: 'DEMO-N002',
         filiere: 'Génie Informatique',
         authSource: 'local',
+        isDemo: 1,
         createdAt: isoOffset(-45),
       },
       {
         id: 'usr-youssef',
-        fullName: 'Youssef El Alaoui',
-        email: 'youssef.alaoui@usmba.ac.ma',
-        passwordHash: studentHash,
+        fullName: 'Youssef Mansouri (Démo)',
+        email: 'youssef.demo@usmba.example',
+        passwordHash: demoLocalHash,
         role: 'membre',
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
-        cne: 'N132004518',
+        cne: 'DEMO-N003',
         filiere: 'Génie Électrique',
         authSource: 'local',
+        isDemo: 1,
         createdAt: isoOffset(-50),
       },
       {
         id: 'usr-karim',
-        fullName: 'Karim Tazi',
-        email: 'karim.tazi@usmba.ac.ma',
-        passwordHash: studentHash,
+        fullName: 'Karim Berrada (Démo)',
+        email: 'karim.demo@usmba.example',
+        passwordHash: demoLocalHash,
         role: 'membre',
         institution: 'EST Fès',
         studentStatus: 'en_attente',
         accountStatus: 'actif',
-        cne: 'N141223980',
+        cne: 'DEMO-N004',
         filiere: 'Techniques de Management',
         authSource: 'local',
+        isDemo: 1,
         createdAt: isoOffset(-10),
       },
       {
         id: 'usr-lib',
-        fullName: 'Nadia Benjelloun',
-        email: 'bibliothecaire@est-usmba.ac.ma',
-        passwordHash: librarianHash,
+        fullName: 'Nadia Benali (Démo)',
+        email: 'bibliothecaire.demo@est-usmba.example',
+        passwordHash: demoLocalHash,
         role: 'bibliothecaire',
         institution: 'EST Fès',
         studentStatus: 'verifie',
@@ -194,6 +320,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         cne: null,
         filiere: 'Direction de la Bibliothèque EST Fès',
         authSource: 'local',
+        isDemo: 1,
         createdAt: isoOffset(-120),
       },
     ];
@@ -201,8 +328,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
     for (const u of users) insertUser.run(u);
 
     const insertBook = db.prepare(`
-      INSERT INTO books (id, title, authors, isbn, category, description, publisher, publicationYear, edition, language, coverImage, shelfLocation, archived, featured, createdAt)
-      VALUES (@id, @title, @authors, @isbn, @category, @description, @publisher, @publicationYear, @edition, @language, @coverImage, @shelfLocation, @archived, @featured, @createdAt)
+      INSERT INTO books (id, title, authors, isbn, category, description, publisher, publicationYear, edition, language, coverImage, shelfLocation, archived, featured, isDemo, createdAt)
+      VALUES (@id, @title, @authors, @isbn, @category, @description, @publisher, @publicationYear, @edition, @language, @coverImage, @shelfLocation, @archived, @featured, 1, @createdAt)
     `);
 
     const books = [

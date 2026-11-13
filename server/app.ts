@@ -11,22 +11,115 @@ import {
   buildCookieOptions,
   type AuthenticatedRequest,
 } from './auth/session.ts';
-import { hashPassword, verifyPassword } from './auth/password.ts';
-import { usmbaSsoAdapter } from './auth/usmbaSsoAdapter.ts';
+import { verifyPassword } from './auth/password.ts';
+import { googleAuthAdapter } from './auth/googleAuthAdapter.ts';
 import { DomainError, LibraryService } from './services/libraryService.ts';
-import type {
-  AccountStatus,
-  CopyStatus,
-  PhysicalCondition,
-  ReturnInspectionOutcome,
-  StudentStatus,
-  UserPublic,
+import {
+  MAX_QUANTITY_PER_TITLE,
+  type AccountStatus,
+  type CopyStatus,
+  type PhysicalCondition,
+  type ReturnInspectionOutcome,
+  type StudentStatus,
+  type UserPublic,
 } from '../shared/types.ts';
+
+function getOAuthStateSecret(): string {
+  return process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16
+    ? process.env.SESSION_SECRET
+    : crypto
+        .createHash('sha256')
+        .update(process.cwd() + '_biblioest_oauth_state_key')
+        .digest('hex');
+}
+
+function renderOAuthPopupHtml(payload: Record<string, unknown>, fallbackText: string): string {
+  const serialized = JSON.stringify(payload).replace(/</g, '\\u003c');
+  const safeText = fallbackText
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return `<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <title>BiblioEST · Authentification Google</title>
+    <style>
+      body { font-family: system-ui, -apple-system, sans-serif; background: #fbf9f5; color: #1f2937; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; }
+      .card { max-width: 440px; border: 1px solid #d1d5db; background: #ffffff; padding: 24px; }
+      h1 { font-size: 16px; margin: 0 0 8px; color: #163056; }
+      p { font-size: 14px; line-height: 1.5; margin: 0 0 16px; color: #4b5563; }
+      a { color: #163056; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>BiblioEST · EST Fès (USMBA)</h1>
+      <p>${safeText}</p>
+      <a href="/">Retourner à l’application</a>
+    </div>
+    <script>
+      (function () {
+        var payload = ${serialized};
+        try {
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage(payload, '*');
+            setTimeout(function () { window.close(); }, 180);
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </body>
+</html>`;
+}
 
 export function createApp(db: Database.Database, getNow: () => Date = () => new Date()) {
   const app = express();
   const service = new LibraryService(db);
   const { attachUser, requireAuth, requireLibrarian } = createAuthMiddleware(db);
+  const usedStates = new Set<string>();
+  const pendingHandoffs = new Map<
+    string,
+    { userId: string; requiresLibrarianValidation: boolean; exp: number }
+  >();
+
+  function createSignedOAuthState(): string {
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const ts = Date.now().toString(36);
+    const body = `${nonce}.${ts}`;
+    const sig = crypto
+      .createHmac('sha256', getOAuthStateSecret())
+      .update(body)
+      .digest('base64url');
+    return `${body}.${sig}`;
+  }
+
+  function verifySignedOAuthState(state: string): boolean {
+    if (!state || usedStates.has(state)) return false;
+    const parts = state.split('.');
+    if (parts.length !== 3) return false;
+    const [nonce, tsStr, sig] = parts;
+    if (!nonce || !tsStr || !sig) return false;
+    const body = `${nonce}.${tsStr}`;
+    const expected = crypto
+      .createHmac('sha256', getOAuthStateSecret())
+      .update(body)
+      .digest('base64url');
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return false;
+    }
+    const issuedAt = parseInt(tsStr, 36);
+    if (!Number.isFinite(issuedAt) || Date.now() - issuedAt > 10 * 60 * 1000) {
+      return false;
+    }
+    usedStates.add(state);
+    if (usedStates.size > 1000) {
+      usedStates.clear();
+    }
+    return true;
+  }
 
   app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
   app.use(express.json());
@@ -42,25 +135,154 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ ok: true });
   });
 
-  // --- Authentification & SSO USMBA ---
+  // --- Authentification Google Institutionnelle & SSO USMBA ---
 
-  app.get('/api/auth/sso/status', (_req, res) => {
-    res.json(usmbaSsoAdapter.getStatus());
+  app.get('/api/auth/google/status', (_req, res) => {
+    res.json(googleAuthAdapter.getStatus());
   });
 
-  app.get('/api/auth/sso/login', (_req, res) => {
-    if (!usmbaSsoAdapter.isConfigured()) {
+  app.get('/api/auth/google/url', (_req, res) => {
+    if (!googleAuthAdapter.isConfigured()) {
+      const status = googleAuthAdapter.getStatus();
       res.status(501).json({
-        error:
-          'Le fournisseur SSO officiel de l’USMBA n’est pas configuré dans cet environnement.',
-        code: 'SSO_NOT_CONFIGURED',
-        sso: usmbaSsoAdapter.getStatus(),
+        error: status.message,
+        code: 'GOOGLE_OAUTH_NOT_CONFIGURED',
+        googleAuth: status,
       });
       return;
     }
-    const state = crypto.randomBytes(16).toString('hex');
-    const url = usmbaSsoAdapter.buildAuthorizationUrl(state);
-    res.json({ authorizationUrl: url });
+
+    const state = createSignedOAuthState();
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const authorizationUrl = googleAuthAdapter.buildAuthorizationUrl(state, nonce);
+    res.json({ authorizationUrl });
+  });
+
+  app.get(['/api/auth/google/callback', '/api/auth/google/callback/'], async (req, res) => {
+    const errorParam = typeof req.query.error === 'string' ? req.query.error : null;
+    const code = typeof req.query.code === 'string' ? req.query.code : null;
+    const state = typeof req.query.state === 'string' ? req.query.state : null;
+
+    if (errorParam) {
+      res
+        .status(400)
+        .send(
+          renderOAuthPopupHtml(
+            {
+              type: 'OAUTH_AUTH_ERROR',
+              error:
+                errorParam === 'access_denied'
+                  ? 'Connexion Google annulée par l’utilisateur.'
+                  : `Erreur retournée par Google OAuth : ${errorParam}`,
+            },
+            'La connexion Google a été annulée ou refusée. Vous pouvez fermer cette fenêtre.'
+          )
+        );
+      return;
+    }
+
+    if (!code || !state || !verifySignedOAuthState(state)) {
+      res
+        .status(400)
+        .send(
+          renderOAuthPopupHtml(
+            {
+              type: 'OAUTH_AUTH_ERROR',
+              error: 'Paramètres OAuth invalides ou expirés. Veuillez relancer la connexion.',
+            },
+            'Requête d’authentification invalide ou expirée. Veuillez fermer cette fenêtre et réessayer.'
+          )
+        );
+      return;
+    }
+
+    try {
+      const now = getNow();
+      const claims = await googleAuthAdapter.exchangeCodeForClaims(code);
+      const resolution = await googleAuthAdapter.resolveProvisionedUser(db, claims, now);
+
+      setSessionCookie(req, res, resolution.user.id);
+      service.recordAuditLog(
+        resolution.user,
+        'AUTH_GOOGLE_LOGIN',
+        'user',
+        resolution.user.id,
+        `Connexion Google OIDC vérifiée pour ${resolution.user.email} (statut EST Fès : ${resolution.user.studentStatus}).`,
+        now
+      );
+
+      const handoffToken = crypto.randomBytes(24).toString('hex');
+      pendingHandoffs.set(handoffToken, {
+        userId: resolution.user.id,
+        requiresLibrarianValidation: resolution.requiresLibrarianValidation,
+        exp: Date.now() + 60 * 1000,
+      });
+
+      res.send(
+        renderOAuthPopupHtml(
+          {
+            type: 'OAUTH_AUTH_SUCCESS',
+            handoffToken,
+            requiresLibrarianValidation: resolution.requiresLibrarianValidation,
+          },
+          'Authentification Google confirmée. Redirection vers BiblioEST en cours…'
+        )
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Impossible de finaliser l’authentification Google.';
+      res
+        .status(403)
+        .send(
+          renderOAuthPopupHtml(
+            {
+              type: 'OAUTH_AUTH_ERROR',
+              error: message,
+            },
+            message
+          )
+        );
+    }
+  });
+
+  app.post('/api/auth/google/handoff', (req: Request, res: Response) => {
+    const { handoffToken } = req.body as { handoffToken?: string };
+    if (!handoffToken) {
+      res.status(400).json({ error: 'Jeton de session OAuth manquant.' });
+      return;
+    }
+
+    const entry = pendingHandoffs.get(handoffToken);
+    pendingHandoffs.delete(handoffToken);
+
+    if (!entry || entry.exp < Date.now()) {
+      res.status(401).json({ error: 'Session OAuth expirée. Veuillez relancer la connexion Google.' });
+      return;
+    }
+
+    const row = db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
+         FROM users WHERE id = ?`
+      )
+      .get(entry.userId) as (UserPublic & { isDemo?: number | boolean }) | undefined;
+
+    if (!row) {
+      res.status(404).json({ error: 'Compte introuvable.' });
+      return;
+    }
+
+    const user: UserPublic = { ...row, isDemo: Boolean(row.isDemo) };
+    setSessionCookie(req, res, user.id);
+    const eligibility = service.checkEligibility(user.id, getNow());
+    res.json({
+      authenticated: true,
+      user,
+      eligibility,
+      requiresLibrarianValidation: entry.requiresLibrarianValidation,
+    });
   });
 
   app.get('/api/auth/me', (req: AuthenticatedRequest, res) => {
@@ -69,146 +291,120 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     const user = req.user || null;
     const eligibility = service.checkEligibility(user?.id, now);
     const cookieReceived = hasSessionCookie(req);
-    const https = isHttpsRequest(req);
-    const crossSiteIframe = isCrossSiteIframeContext(req);
-    console.info('[auth:me]', {
-      status: 200,
-      authenticated: Boolean(user),
-      userId: user?.id || null,
-      role: user?.role || null,
-      cookiePresent: cookieReceived,
-      https,
-      crossSiteIframe,
-    });
     res.json({
       authenticated: Boolean(user),
       cookieReceived,
       user,
       eligibility,
-      sso: usmbaSsoAdapter.getStatus(),
+      googleAuth: googleAuthAdapter.getStatus(),
+      demoModeEnabled: process.env.DISABLE_DEMO_MODE !== 'true',
     });
+  });
+
+  app.post('/api/auth/demo-login', (req: Request, res: Response) => {
+    if (process.env.DISABLE_DEMO_MODE === 'true') {
+      res.status(403).json({
+        error: 'Les comptes de démonstration sont désactivés dans cet environnement.',
+        code: 'DEMO_MODE_DISABLED',
+      });
+      return;
+    }
+
+    const { userId, email } = req.body as { userId?: string; email?: string };
+    const row = (
+      userId
+        ? db.prepare(`SELECT * FROM users WHERE id = ? AND isDemo = 1`).get(userId.trim())
+        : email
+          ? db
+              .prepare(`SELECT * FROM users WHERE LOWER(email) = LOWER(?) AND isDemo = 1`)
+              .get(email.trim())
+          : undefined
+    ) as (UserPublic & { passwordHash: string; isDemo?: number }) | undefined;
+
+    if (!row) {
+      res.status(404).json({
+        error: 'Compte d’évaluation fictif introuvable.',
+        code: 'DEMO_ACCOUNT_NOT_FOUND',
+      });
+      return;
+    }
+
+    const { passwordHash: _ignored, isDemo, ...userBase } = row;
+    const userPublic: UserPublic = { ...userBase, isDemo: Boolean(isDemo) };
+    const now = getNow();
+    setSessionCookie(req, res, userPublic.id);
+    const eligibility = service.checkEligibility(userPublic.id, now);
+    service.recordAuditLog(
+      userPublic,
+      'AUTH_DEMO_LOGIN',
+      'user',
+      userPublic.id,
+      `Connexion via compte fictif d’évaluation (${userPublic.email}).`,
+      now
+    );
+    res.json({ authenticated: true, user: userPublic, eligibility });
   });
 
   app.post('/api/auth/login', (req: Request, res: Response) => {
     const { email, password } = req.body as { email?: string; password?: string };
-    const https = isHttpsRequest(req);
     if (!email || !password) {
-      console.info('[auth:login]', { status: 400, outcome: 'MISSING_FIELDS', https });
       res.status(400).json({ error: 'Adresse e-mail et mot de passe requis.' });
       return;
     }
 
     const row = db
       .prepare(`SELECT * FROM users WHERE LOWER(email) = LOWER(?)`)
-      .get(email.trim()) as (UserPublic & { passwordHash: string }) | undefined;
+      .get(email.trim()) as (UserPublic & { passwordHash: string; isDemo?: number }) | undefined;
+
+    if (row && (!Boolean(row.isDemo) || row.authSource === 'google_oidc')) {
+      res.status(403).json({
+        error:
+          'Les comptes institutionnels s’authentifient exclusivement via le bouton « Se connecter avec Google ». Aucun mot de passe Google ne doit être saisi ici.',
+        code: 'GOOGLE_OAUTH_REQUIRED',
+      });
+      return;
+    }
+
+    if (process.env.DISABLE_DEMO_MODE === 'true') {
+      res.status(403).json({
+        error:
+          'L’authentification locale de démonstration est désactivée. Utilisez le bouton « Se connecter avec Google ».',
+        code: 'DEMO_MODE_DISABLED',
+      });
+      return;
+    }
 
     const passwordValid = row ? verifyPassword(password, row.passwordHash) : false;
     if (!row || !passwordValid) {
-      console.info('[auth:login]', {
-        status: 401,
-        outcome: row ? 'INVALID_PASSWORD' : 'USER_NOT_FOUND',
-        https,
-      });
       res.status(401).json({
-        error: 'Identifiants invalides. Vérifiez votre adresse USMBA et votre mot de passe.',
+        error: 'Identifiants de démonstration invalides.',
         code: 'INVALID_CREDENTIALS',
       });
       return;
     }
 
-    const { passwordHash: _ignored, ...userPublic } = row;
+    const { passwordHash: _ignored, isDemo, ...userBase } = row;
+    const userPublic: UserPublic = { ...userBase, isDemo: Boolean(isDemo) };
+    const now = getNow();
     setSessionCookie(req, res, userPublic.id);
-    const cookieOpts = buildCookieOptions(req);
-    const eligibility = service.checkEligibility(userPublic.id, getNow());
-    console.info('[auth:login]', {
-      status: 200,
-      outcome: 'AUTHENTICATED',
-      userId: userPublic.id,
-      role: userPublic.role,
-      eligible: eligibility.eligible,
-      https,
-      sameSite: cookieOpts.sameSite,
-      secure: Boolean(cookieOpts.secure),
-      partitioned: Boolean(cookieOpts.partitioned),
-    });
+    const eligibility = service.checkEligibility(userPublic.id, now);
+    service.recordAuditLog(
+      userPublic,
+      'AUTH_DEMO_LOGIN',
+      'user',
+      userPublic.id,
+      `Connexion via compte fictif d’évaluation (${userPublic.email}).`,
+      now
+    );
     res.json({ authenticated: true, user: userPublic, eligibility });
   });
 
-  app.post('/api/auth/register', (req: Request, res: Response) => {
-    const { fullName, email, password, cne, filiere, institution } = req.body as {
-      fullName?: string;
-      email?: string;
-      password?: string;
-      cne?: string;
-      filiere?: string;
-      institution?: string;
-    };
-
-    if (!fullName || !email || !password || password.length < 8) {
-      res.status(400).json({
-        error:
-          'Nom complet, adresse e-mail et mot de passe (8 caractères minimum) sont requis.',
-      });
-      return;
-    }
-
-    const normalizedEmail = email.trim().toLowerCase();
-    if (!normalizedEmail.endsWith('@usmba.ac.ma') && !normalizedEmail.endsWith('@est-usmba.ac.ma')) {
-      res.status(400).json({
-        error: 'Seules les adresses universitaires USMBA (@usmba.ac.ma) sont acceptées.',
-      });
-      return;
-    }
-
-    const existing = db
-      .prepare(`SELECT id FROM users WHERE LOWER(email) = ?`)
-      .get(normalizedEmail);
-    if (existing) {
-      res.status(409).json({
-        error: 'Un compte associé à cette adresse e-mail USMBA existe déjà.',
-      });
-      return;
-    }
-
-    // Règle métier : l'inscription locale ne confère JAMAIS automatiquement le statut étudiant EST Fès vérifié.
-    const userId = `usr-${crypto.randomUUID().slice(0, 12)}`;
-    const nowIso = getNow().toISOString();
-    const targetInstitution = institution?.trim() || 'EST Fès';
-    const initialStudentStatus: StudentStatus =
-      targetInstitution === 'EST Fès' ? 'en_attente' : 'non_est';
-
-    db.prepare(
-      `INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt)
-       VALUES (?, ?, ?, ?, 'membre', ?, ?, 'actif', ?, ?, 'local', ?)`
-    ).run(
-      userId,
-      fullName.trim(),
-      normalizedEmail,
-      hashPassword(password),
-      targetInstitution,
-      initialStudentStatus,
-      cne?.trim() || null,
-      filiere?.trim() || null,
-      nowIso
-    );
-
-    const user = db
-      .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt
-         FROM users WHERE id = ?`
-      )
-      .get(userId) as UserPublic;
-
-    setSessionCookie(req, res, user.id);
-    const eligibility = service.checkEligibility(user.id, getNow());
-    console.info('[auth:register]', {
-      status: 201,
-      outcome: 'REGISTERED',
-      userId: user.id,
-      studentStatus: user.studentStatus,
-      https: isHttpsRequest(req),
+  app.post('/api/auth/register', (_req: Request, res: Response) => {
+    res.status(403).json({
+      error:
+        'Les comptes académiques sont fournis et administrés par l’école. La création autonome de compte ou d’adresse académique est désactivée.',
+      code: 'SELF_REGISTRATION_DISABLED',
     });
-    res.status(201).json({ user, eligibility });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -310,6 +506,73 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ ok: true });
   });
 
+  // --- Panier de demandes (ne réserve jamais d'exemplaire avant confirmation serveur) ---
+
+  app.get('/api/cart', requireAuth, (req: AuthenticatedRequest, res) => {
+    const items = service.getCart(req.user!.id, getNow());
+    res.json({ items, maxQuantityPerTitle: MAX_QUANTITY_PER_TITLE });
+  });
+
+  app.post('/api/cart/items', requireAuth, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const { bookId, quantity } = req.body as { bookId?: string; quantity?: number };
+      if (!bookId) {
+        res.status(400).json({ error: 'Identifiant d’ouvrage requis.' });
+        return;
+      }
+      const items = service.addToCart(
+        req.user!.id,
+        bookId,
+        quantity === undefined ? 1 : Number(quantity),
+        getNow()
+      );
+      res.status(201).json({ items });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.patch('/api/cart/items/:bookId', requireAuth, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const { quantity } = req.body as { quantity?: number };
+      if (quantity === undefined) {
+        res.status(400).json({ error: 'Quantité requise.' });
+        return;
+      }
+      const items = service.updateCartItemQuantity(
+        req.user!.id,
+        String(req.params.bookId),
+        Number(quantity),
+        getNow()
+      );
+      res.json({ items });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/cart/items/:bookId', requireAuth, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const items = service.removeFromCart(
+        req.user!.id,
+        String(req.params.bookId),
+        getNow()
+      );
+      res.json({ items });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/cart/confirm', requireAuth, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const confirmation = service.confirmCart(req.user!.id, getNow());
+      res.json(confirmation);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // --- Espace Bibliothécaire (strictement protégé par requireLibrarian) ---
 
   app.get('/api/admin/stats', requireLibrarian, (_req, res) => {
@@ -321,7 +584,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ books });
   });
 
-  app.post('/api/admin/books', requireLibrarian, (req, res, next) => {
+  app.post('/api/admin/books', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
       const {
         title,
@@ -360,7 +623,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
           shelfLocation,
           featured: Boolean(featured),
         },
-        getNow()
+        getNow(),
+        req.user!
       );
       res.status(201).json({ book });
     } catch (err) {
@@ -368,9 +632,9 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   });
 
-  app.patch('/api/admin/books/:id', requireLibrarian, (req, res, next) => {
+  app.patch('/api/admin/books/:id', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
-      const book = service.updateBook(String(req.params.id), req.body);
+      const book = service.updateBook(String(req.params.id), req.body, req.user!, getNow());
       res.json({ book });
     } catch (err) {
       next(err);
@@ -381,7 +645,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ copies: service.getAllCopiesAdmin() });
   });
 
-  app.post('/api/admin/books/:id/copies', requireLibrarian, (req, res, next) => {
+  app.post('/api/admin/books/:id/copies', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
       const { barcode, physicalCondition, location } = req.body as {
         barcode?: string;
@@ -397,7 +661,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       const result = service.registerCopy(
         String(req.params.id),
         { barcode, physicalCondition, location },
-        getNow()
+        getNow(),
+        req.user!
       );
       res.status(201).json(result);
     } catch (err) {
@@ -405,7 +670,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   });
 
-  app.patch('/api/admin/copies/:id', requireLibrarian, (req, res, next) => {
+  app.patch('/api/admin/copies/:id', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
       const { status, physicalCondition, location } = req.body as {
         status?: CopyStatus;
@@ -423,7 +688,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         status,
         physicalCondition,
         location,
-        getNow()
+        getNow(),
+        req.user!
       );
       res.json({ copy });
     } catch (err) {
@@ -431,16 +697,16 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   });
 
-  app.post('/api/admin/copies/:id/complete-repair', requireLibrarian, (req, res, next) => {
+  app.post('/api/admin/copies/:id/complete-repair', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
-      const copy = service.completeCopyRepair(String(req.params.id));
+      const copy = service.completeCopyRepair(String(req.params.id), req.user!, getNow());
       res.json({ copy });
     } catch (err) {
       next(err);
     }
   });
 
-  app.post('/api/admin/copies/:id/inspect', requireLibrarian, (req, res, next) => {
+  app.post('/api/admin/copies/:id/inspect', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
       const { outcome, physicalCondition } = req.body as {
         outcome?: ReturnInspectionOutcome;
@@ -456,7 +722,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         String(req.params.id),
         outcome,
         physicalCondition,
-        getNow()
+        getNow(),
+        req.user!
       );
       res.json(result);
     } catch (err) {
@@ -468,7 +735,25 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ loans: service.getAllLoansAdmin(getNow()) });
   });
 
-  app.post('/api/admin/loans/:id/return', requireLibrarian, (req, res, next) => {
+  app.post('/api/admin/loans', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const { memberId, bookId, copyId } = req.body as {
+        memberId?: string;
+        bookId?: string;
+        copyId?: string | null;
+      };
+      if (!memberId || !bookId) {
+        res.status(400).json({ error: 'Membre et ouvrage requis pour enregistrer un prêt.' });
+        return;
+      }
+      const loan = service.createLoanAdmin(memberId, bookId, copyId || null, req.user!, getNow());
+      res.status(201).json({ loan });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/loans/:id/return', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
       const { outcome, physicalCondition, notes } = req.body as {
         outcome?: ReturnInspectionOutcome;
@@ -486,7 +771,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         outcome,
         physicalCondition,
         notes,
-        getNow()
+        getNow(),
+        req.user!
       );
       res.json(result);
     } catch (err) {
@@ -498,9 +784,40 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ reservations: service.getAllReservationsAdmin(getNow()) });
   });
 
-  app.post('/api/admin/reservations/:id/pickup', requireLibrarian, (req, res, next) => {
+  app.post('/api/admin/reservations/allocate', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
-      const loan = service.fulfillReservationPickup(String(req.params.id), getNow());
+      const { bookId } = req.body as { bookId?: string };
+      if (!bookId) {
+        res.status(400).json({ error: 'Identifiant d’ouvrage requis.' });
+        return;
+      }
+      const result = service.allocateAvailableCopyToQueueAdmin(bookId, req.user!, getNow());
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post(
+    '/api/admin/reservations/:id/confirm-availability',
+    requireLibrarian,
+    (req: AuthenticatedRequest, res, next) => {
+      try {
+        const reservation = service.confirmReservationAvailability(
+          String(req.params.id),
+          req.user!,
+          getNow()
+        );
+        res.json({ reservation });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post('/api/admin/reservations/:id/pickup', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const loan = service.fulfillReservationPickup(String(req.params.id), getNow(), req.user!);
       res.json({ loan });
     } catch (err) {
       next(err);
@@ -533,7 +850,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ members: service.listMembersAdmin() });
   });
 
-  app.patch('/api/admin/members/:id/verification', requireLibrarian, (req, res, next) => {
+  app.patch('/api/admin/members/:id/verification', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
       const { studentStatus, accountStatus } = req.body as {
         studentStatus?: StudentStatus;
@@ -546,12 +863,20 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       const member = service.updateMemberVerificationAdmin(
         String(req.params.id),
         studentStatus,
-        accountStatus
+        accountStatus,
+        req.user!,
+        getNow()
       );
       res.json({ member });
     } catch (err) {
       next(err);
     }
+  });
+
+  app.get('/api/admin/audit-logs', requireLibrarian, (req, res) => {
+    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 100;
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 100;
+    res.json({ logs: service.getAuditLogsAdmin(limit) });
   });
 
   // Gestion centralisée des erreurs métier

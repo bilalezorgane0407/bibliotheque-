@@ -2,10 +2,15 @@ import crypto from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
   BORROWING_DURATION_DAYS,
+  MAX_QUANTITY_PER_TITLE,
   PICKUP_WINDOW_DAYS,
+  type AuditLogRecord,
   type Book,
   type BookDetail,
   type BookWithStats,
+  type CartConfirmationItemResult,
+  type CartConfirmationResponse,
+  type CartItemRecord,
   type Copy,
   type CopyStatus,
   type DashboardStats,
@@ -19,6 +24,12 @@ import {
   type AccountStatus,
   type UserPublic,
 } from '../../shared/types.ts';
+
+type AuditActor = {
+  id?: string | null;
+  fullName?: string | null;
+  role?: string | null;
+};
 
 export class DomainError extends Error {
   public readonly statusCode: number;
@@ -80,12 +91,49 @@ export class LibraryService {
       .run(this.generateId('ntf'), userId, title, message, type, now.toISOString());
   }
 
+  private insertAuditLogInternal(
+    actor: AuditActor | null | undefined,
+    action: string,
+    entityType: string,
+    entityId: string,
+    summary: string,
+    now: Date
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO audit_logs (id, actorId, actorName, actorRole, action, entityType, entityId, summary, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.generateId('aud'),
+        actor?.id || null,
+        actor?.fullName || null,
+        actor?.role || null,
+        action,
+        entityType,
+        entityId,
+        summary,
+        now.toISOString()
+      );
+  }
+
+  public recordAuditLog(
+    actor: AuditActor | null | undefined,
+    action: string,
+    entityType: string,
+    entityId: string,
+    summary: string,
+    now: Date = new Date()
+  ): void {
+    this.insertAuditLogInternal(actor, action, entityType, entityId, summary, now);
+  }
+
   private recalculateQueuePositionsInternal(bookId: string): void {
     const pending = this.db
       .prepare(
         `SELECT id FROM reservations
          WHERE bookId = ? AND status = 'En attente'
-         ORDER BY requestedAt ASC, rowid ASC`
+         ORDER BY requestedAt ASC, rowid ASC, id ASC`
       )
       .all(bookId) as Array<{ id: string }>;
 
@@ -209,7 +257,8 @@ export class LibraryService {
   private assignCopyToNextEligibleReservationInternal(
     bookId: string,
     copyId: string,
-    now: Date
+    now: Date,
+    actor?: AuditActor | null
   ): string | null {
     const book = this.db
       .prepare(`SELECT title FROM books WHERE id = ?`)
@@ -224,7 +273,7 @@ export class LibraryService {
       .prepare(
         `SELECT id, memberId, requestedAt FROM reservations
          WHERE bookId = ? AND status = 'En attente'
-         ORDER BY requestedAt ASC, rowid ASC`
+         ORDER BY requestedAt ASC, rowid ASC, id ASC`
       )
       .all(bookId) as Array<{ id: string; memberId: string; requestedAt: string }>;
 
@@ -234,36 +283,44 @@ export class LibraryService {
         continue;
       }
 
-      const nowIso = now.toISOString();
-      const deadlineIso = addDaysIso(now, PICKUP_WINDOW_DAYS);
-
       this.db
         .prepare(
           `UPDATE copies
-           SET status = 'Réservé', location = 'Banque d’accueil · Retrait réservations'
+           SET status = 'Réservé', location = 'Banque d’accueil · En attente de confirmation'
            WHERE id = ?`
         )
         .run(copyId);
 
+      // Règle 7 & 8 : l'exemplaire est proposé au premier membre éligible,
+      // mais le délai de retrait de 3 jours ne démarre qu'après confirmation par le bibliothécaire.
       this.db
         .prepare(
           `UPDATE reservations
-           SET status = 'Disponible pour retrait',
+           SET status = 'Exemplaire attribué',
                assignedCopyId = ?,
-               availableAt = ?,
-               pickupDeadline = ?,
+               availableAt = NULL,
+               pickupDeadline = NULL,
                queuePosition = NULL
            WHERE id = ?`
         )
-        .run(copyId, nowIso, deadlineIso, candidate.id);
+        .run(copyId, candidate.id);
 
       this.recalculateQueuePositionsInternal(bookId);
 
       this.insertNotificationInternal(
         candidate.memberId,
-        'Ouvrage réservé disponible pour retrait',
-        `Un exemplaire de « ${book.title} » (${copy.barcode}) vous est attribué. Vous avez jusqu’au ${formatFrenchDateTime(deadlineIso)} (3 jours) pour le retirer à la bibliothèque.`,
-        'retrait',
+        'Exemplaire attribué — confirmation bibliothèque en attente',
+        `Un exemplaire de « ${book.title} » (${copy.barcode}) vous a été attribué selon l’ordre FIFO. Le délai de retrait de 3 jours commencera dès que le bibliothécaire aura confirmé sa mise à disposition.`,
+        'reservation',
+        now
+      );
+
+      this.insertAuditLogInternal(
+        actor,
+        'RESERVATION_PROPOSED',
+        'reservation',
+        candidate.id,
+        `Exemplaire ${copy.barcode} (« ${book.title} ») attribué en priorité FIFO à la réservation ${candidate.id} (confirmation de mise à disposition requise).`,
         now
       );
 
@@ -314,6 +371,15 @@ export class LibraryService {
         'Réservation expirée',
         `Le délai de retrait de 3 jours pour « ${res.bookTitle} » est dépassé. Votre réservation a expiré et l’exemplaire a été libéré.`,
         'expiration',
+        now
+      );
+
+      this.insertAuditLogInternal(
+        { id: 'system', fullName: 'Système échéances', role: 'system' },
+        'RESERVATION_EXPIRED',
+        'reservation',
+        res.id,
+        `Délai de retrait de 3 jours expiré pour « ${res.bookTitle} » (réservation ${res.id}).`,
         now
       );
 
@@ -412,6 +478,7 @@ export class LibraryService {
       shelfLocation: String(r.shelfLocation),
       archived: Boolean(r.archived),
       featured: Boolean(r.featured),
+      isDemo: Boolean(r.isDemo),
       createdAt: String(r.createdAt),
       totalCopies: Number(r.totalCopies),
       availableCopies: Number(r.availableCopies),
@@ -523,6 +590,7 @@ export class LibraryService {
       shelfLocation: String(bookRow.shelfLocation),
       archived: Boolean(bookRow.archived),
       featured: Boolean(bookRow.featured),
+      isDemo: Boolean(bookRow.isDemo),
       createdAt: String(bookRow.createdAt),
       totalCopies,
       availableCopies,
@@ -539,204 +607,269 @@ export class LibraryService {
     };
   }
 
+  private borrowBookInternal(
+    memberId: string,
+    bookId: string,
+    now: Date,
+    preferredCopyId?: string | null,
+    actor?: AuditActor | null
+  ): LoanRecord {
+    this.assertEligibleInternal(memberId, now);
+
+    const book = this.db
+      .prepare(`SELECT * FROM books WHERE id = ?`)
+      .get(bookId) as Record<string, unknown> | undefined;
+
+    if (!book) {
+      throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
+    }
+    if (Boolean(book.archived)) {
+      throw new DomainError('Cet ouvrage est archivé et ne peut pas être emprunté.', 409, 'BOOK_ARCHIVED');
+    }
+
+    const existingMemberLoan = this.db
+      .prepare(
+        `SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`
+      )
+      .get(memberId, bookId);
+    if (existingMemberLoan) {
+      throw new DomainError(
+        'Vous détenez déjà un exemplaire actif de cet ouvrage.',
+        409,
+        'DUPLICATE_ACTIVE_LOAN'
+      );
+    }
+
+    const availableCopy = preferredCopyId
+      ? (this.db
+          .prepare(
+            `SELECT * FROM copies
+             WHERE id = ?
+               AND bookId = ?
+               AND status = 'Disponible'
+               AND needsInspection = 0
+               AND physicalCondition NOT IN ('Endommagé', 'Hors service')`
+          )
+          .get(preferredCopyId, bookId) as Record<string, unknown> | undefined)
+      : (this.db
+          .prepare(
+            `SELECT * FROM copies
+             WHERE bookId = ?
+               AND status = 'Disponible'
+               AND needsInspection = 0
+               AND physicalCondition NOT IN ('Endommagé', 'Hors service')
+             ORDER BY barcode ASC
+             LIMIT 1`
+          )
+          .get(bookId) as Record<string, unknown> | undefined);
+
+    if (!availableCopy) {
+      throw new DomainError(
+        'Aucun exemplaire disponible pour cet ouvrage. Vous pouvez effectuer une réservation si des exemplaires sont en circulation.',
+        409,
+        'NO_AVAILABLE_COPY'
+      );
+    }
+
+    const updateResult = this.db
+      .prepare(
+        `UPDATE copies SET status = 'Emprunté'
+         WHERE id = ? AND status = 'Disponible' AND needsInspection = 0`
+      )
+      .run(String(availableCopy.id));
+
+    if (updateResult.changes !== 1) {
+      throw new DomainError(
+        'Conflit concurrent : cet exemplaire vient d’être attribué.',
+        409,
+        'COPY_RACE_CONFLICT'
+      );
+    }
+
+    const loanId = this.generateId('ln');
+    const borrowedAt = now.toISOString();
+    const dueAt = addDaysIso(now, BORROWING_DURATION_DAYS);
+
+    this.db
+      .prepare(
+        `INSERT INTO loans (id, memberId, copyId, bookId, borrowedAt, dueAt, returnedAt, returnCondition, returnNotes, status)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'En cours')`
+      )
+      .run(loanId, memberId, String(availableCopy.id), bookId, borrowedAt, dueAt);
+
+    this.insertNotificationInternal(
+      memberId,
+      'Emprunt confirmé',
+      `Votre emprunt pour « ${String(book.title)} » (exemplaire ${String(availableCopy.barcode)}) est confirmé. Date limite de retour : ${formatFrenchDateTime(dueAt)} (7 jours).`,
+      'emprunt',
+      now
+    );
+
+    this.insertAuditLogInternal(
+      actor || { id: memberId, role: 'membre' },
+      'LOAN_CREATED',
+      'loan',
+      loanId,
+      `Prêt enregistré pour « ${String(book.title)} » (exemplaire ${String(availableCopy.barcode)}, membre ${memberId}).`,
+      now
+    );
+
+    return this.getLoanByIdInternal(loanId)!;
+  }
+
   public borrowBook(memberId: string, bookId: string, now: Date = new Date()): LoanRecord {
     const tx = this.db.transaction(() => {
       this.syncOverdueLoansInternal(now);
       this.expireOverdueReservationsInternal(now);
-      this.assertEligibleInternal(memberId, now);
-
-      const book = this.db
-        .prepare(`SELECT * FROM books WHERE id = ?`)
-        .get(bookId) as Record<string, unknown> | undefined;
-
-      if (!book) {
-        throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
-      }
-      if (Boolean(book.archived)) {
-        throw new DomainError('Cet ouvrage est archivé et ne peut pas être emprunté.', 409, 'BOOK_ARCHIVED');
-      }
-
-      const existingMemberLoan = this.db
-        .prepare(
-          `SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`
-        )
-        .get(memberId, bookId);
-      if (existingMemberLoan) {
-        throw new DomainError(
-          'Vous détenez déjà un exemplaire actif de cet ouvrage.',
-          409,
-          'DUPLICATE_ACTIVE_LOAN'
-        );
-      }
-
-      const availableCopy = this.db
-        .prepare(
-          `SELECT * FROM copies
-           WHERE bookId = ?
-             AND status = 'Disponible'
-             AND needsInspection = 0
-             AND physicalCondition NOT IN ('Endommagé', 'Hors service')
-           ORDER BY barcode ASC
-           LIMIT 1`
-        )
-        .get(bookId) as Record<string, unknown> | undefined;
-
-      if (!availableCopy) {
-        throw new DomainError(
-          'Aucun exemplaire disponible pour cet ouvrage. Vous pouvez effectuer une réservation si des exemplaires sont en circulation.',
-          409,
-          'NO_AVAILABLE_COPY'
-        );
-      }
-
-      const updateResult = this.db
-        .prepare(
-          `UPDATE copies SET status = 'Emprunté'
-           WHERE id = ? AND status = 'Disponible' AND needsInspection = 0`
-        )
-        .run(String(availableCopy.id));
-
-      if (updateResult.changes !== 1) {
-        throw new DomainError(
-          'Conflit concurrent : cet exemplaire vient d’être attribué.',
-          409,
-          'COPY_RACE_CONFLICT'
-        );
-      }
-
-      const loanId = this.generateId('ln');
-      const borrowedAt = now.toISOString();
-      const dueAt = addDaysIso(now, BORROWING_DURATION_DAYS);
-
-      this.db
-        .prepare(
-          `INSERT INTO loans (id, memberId, copyId, bookId, borrowedAt, dueAt, returnedAt, returnCondition, returnNotes, status)
-           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'En cours')`
-        )
-        .run(loanId, memberId, String(availableCopy.id), bookId, borrowedAt, dueAt);
-
-      this.insertNotificationInternal(
-        memberId,
-        'Emprunt confirmé',
-        `Votre emprunt pour « ${String(book.title)} » (exemplaire ${String(availableCopy.barcode)}) est confirmé. Date limite de retour : ${formatFrenchDateTime(dueAt)} (7 jours).`,
-        'emprunt',
-        now
-      );
-
-      return this.getLoanByIdInternal(loanId)!;
+      return this.borrowBookInternal(memberId, bookId, now);
     });
 
     return tx.immediate();
+  }
+
+  public createLoanAdmin(
+    memberId: string,
+    bookId: string,
+    copyId: string | null | undefined,
+    actor: AuditActor,
+    now: Date = new Date()
+  ): LoanRecord {
+    const tx = this.db.transaction(() => {
+      this.syncOverdueLoansInternal(now);
+      this.expireOverdueReservationsInternal(now);
+      return this.borrowBookInternal(memberId, bookId, now, copyId || null, actor);
+    });
+    return tx.immediate();
+  }
+
+  private reserveBookInternal(
+    memberId: string,
+    bookId: string,
+    now: Date,
+    actor?: AuditActor | null
+  ): ReservationRecord {
+    this.assertEligibleInternal(memberId, now);
+
+    const book = this.db
+      .prepare(`SELECT * FROM books WHERE id = ?`)
+      .get(bookId) as Record<string, unknown> | undefined;
+
+    if (!book) {
+      throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
+    }
+    if (Boolean(book.archived)) {
+      throw new DomainError(
+        'Cet ouvrage est archivé et ne peut pas être réservé.',
+        409,
+        'BOOK_ARCHIVED'
+      );
+    }
+
+    const activeLoan = this.db
+      .prepare(
+        `SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`
+      )
+      .get(memberId, bookId);
+    if (activeLoan) {
+      throw new DomainError(
+        'Vous empruntez déjà cet ouvrage actuellement.',
+        409,
+        'ALREADY_BORROWED'
+      );
+    }
+
+    const existingRes = this.db
+      .prepare(
+        `SELECT id FROM reservations
+         WHERE memberId = ? AND bookId = ? AND status IN ('En attente', 'Exemplaire attribué', 'Disponible pour retrait')`
+      )
+      .get(memberId, bookId);
+    if (existingRes) {
+      throw new DomainError(
+        'Vous avez déjà une réservation active pour cet ouvrage.',
+        409,
+        'DUPLICATE_RESERVATION'
+      );
+    }
+
+    const copies = this.db
+      .prepare(`SELECT * FROM copies WHERE bookId = ?`)
+      .all(bookId) as Array<Record<string, unknown>>;
+
+    const hasAvailable = copies.some(
+      (c) =>
+        c.status === 'Disponible' &&
+        !Boolean(c.needsInspection) &&
+        c.physicalCondition !== 'Endommagé' &&
+        c.physicalCondition !== 'Hors service'
+    );
+
+    if (hasAvailable) {
+      throw new DomainError(
+        'Un exemplaire est actuellement disponible : veuillez emprunter l’ouvrage directement.',
+        409,
+        'COPY_AVAILABLE_NO_RESERVATION'
+      );
+    }
+
+    const hasCirculating = copies.some(
+      (c) => c.status !== 'Retiré définitivement'
+    );
+
+    if (!hasCirculating) {
+      throw new DomainError(
+        'Réservation refusée : tous les exemplaires de cet ouvrage ont été retirés définitivement et ne peuvent plus retourner en circulation.',
+        409,
+        'NO_CIRCULATING_COPIES'
+      );
+    }
+
+    const maxQueueRow = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(queuePosition), 0) as maxPos
+         FROM reservations
+         WHERE bookId = ? AND status = 'En attente'`
+      )
+      .get(bookId) as { maxPos: number };
+
+    const queuePosition = maxQueueRow.maxPos + 1;
+    const reservationId = this.generateId('res');
+    const requestedAt = now.toISOString();
+
+    this.db
+      .prepare(
+        `INSERT INTO reservations (id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
+         VALUES (?, ?, ?, ?, ?, 'En attente', NULL, NULL, NULL, NULL)`
+      )
+      .run(reservationId, memberId, bookId, requestedAt, queuePosition);
+
+    this.recalculateQueuePositionsInternal(bookId);
+
+    this.insertNotificationInternal(
+      memberId,
+      'Réservation enregistrée',
+      `Votre réservation a été enregistrée. Vous serez informé dès qu'un exemplaire sera disponible. Aucune date de disponibilité n'est garantie.`,
+      'reservation',
+      now
+    );
+
+    this.insertAuditLogInternal(
+      actor || { id: memberId, role: 'membre' },
+      'RESERVATION_CREATED',
+      'reservation',
+      reservationId,
+      `Réservation FIFO #${queuePosition} enregistrée pour « ${String(book.title)} » (membre ${memberId}).`,
+      now
+    );
+
+    return this.getReservationByIdInternal(reservationId)!;
   }
 
   public reserveBook(memberId: string, bookId: string, now: Date = new Date()): ReservationRecord {
     const tx = this.db.transaction(() => {
       this.syncOverdueLoansInternal(now);
       this.expireOverdueReservationsInternal(now);
-      this.assertEligibleInternal(memberId, now);
-
-      const book = this.db
-        .prepare(`SELECT * FROM books WHERE id = ?`)
-        .get(bookId) as Record<string, unknown> | undefined;
-
-      if (!book) {
-        throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
-      }
-      if (Boolean(book.archived)) {
-        throw new DomainError(
-          'Cet ouvrage est archivé et ne peut pas être réservé.',
-          409,
-          'BOOK_ARCHIVED'
-        );
-      }
-
-      const activeLoan = this.db
-        .prepare(
-          `SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`
-        )
-        .get(memberId, bookId);
-      if (activeLoan) {
-        throw new DomainError(
-          'Vous empruntez déjà cet ouvrage actuellement.',
-          409,
-          'ALREADY_BORROWED'
-        );
-      }
-
-      const existingRes = this.db
-        .prepare(
-          `SELECT id FROM reservations
-           WHERE memberId = ? AND bookId = ? AND status IN ('En attente', 'Disponible pour retrait')`
-        )
-        .get(memberId, bookId);
-      if (existingRes) {
-        throw new DomainError(
-          'Vous avez déjà une réservation active pour cet ouvrage.',
-          409,
-          'DUPLICATE_RESERVATION'
-        );
-      }
-
-      const copies = this.db
-        .prepare(`SELECT * FROM copies WHERE bookId = ?`)
-        .all(bookId) as Array<Record<string, unknown>>;
-
-      const hasAvailable = copies.some(
-        (c) =>
-          c.status === 'Disponible' &&
-          !Boolean(c.needsInspection) &&
-          c.physicalCondition !== 'Endommagé' &&
-          c.physicalCondition !== 'Hors service'
-      );
-
-      if (hasAvailable) {
-        throw new DomainError(
-          'Un exemplaire est actuellement disponible : veuillez emprunter l’ouvrage directement.',
-          409,
-          'COPY_AVAILABLE_NO_RESERVATION'
-        );
-      }
-
-      const hasCirculating = copies.some(
-        (c) => c.status !== 'Retiré définitivement'
-      );
-
-      if (!hasCirculating) {
-        throw new DomainError(
-          'Réservation refusée : tous les exemplaires de cet ouvrage ont été retirés définitivement et ne peuvent plus retourner en circulation.',
-          409,
-          'NO_CIRCULATING_COPIES'
-        );
-      }
-
-      const maxQueueRow = this.db
-        .prepare(
-          `SELECT COALESCE(MAX(queuePosition), 0) as maxPos
-           FROM reservations
-           WHERE bookId = ? AND status = 'En attente'`
-        )
-        .get(bookId) as { maxPos: number };
-
-      const queuePosition = maxQueueRow.maxPos + 1;
-      const reservationId = this.generateId('res');
-      const requestedAt = now.toISOString();
-
-      this.db
-        .prepare(
-          `INSERT INTO reservations (id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
-           VALUES (?, ?, ?, ?, ?, 'En attente', NULL, NULL, NULL, NULL)`
-        )
-        .run(reservationId, memberId, bookId, requestedAt, queuePosition);
-
-      this.insertNotificationInternal(
-        memberId,
-        'Réservation enregistrée',
-        `Votre réservation a été enregistrée. Vous serez informé dès qu'un exemplaire sera disponible. Aucune date de disponibilité n'est garantie.`,
-        'reservation',
-        now
-      );
-
-      return this.getReservationByIdInternal(reservationId)!;
+      return this.reserveBookInternal(memberId, bookId, now);
     });
 
     return tx.immediate();
@@ -744,7 +877,7 @@ export class LibraryService {
 
   public cancelReservation(
     reservationId: string,
-    actor: Pick<UserPublic, 'id' | 'role'>,
+    actor: AuditActor & Pick<UserPublic, 'id' | 'role'>,
     now: Date = new Date()
   ): ReservationRecord {
     const tx = this.db.transaction(() => {
@@ -800,8 +933,17 @@ export class LibraryService {
         now
       );
 
+      this.insertAuditLogInternal(
+        actor,
+        'RESERVATION_CANCELLED',
+        'reservation',
+        reservationId,
+        `Réservation ${reservationId} pour « ${book?.title || 'Ouvrage'} » annulée (statut précédent : ${status}).`,
+        now
+      );
+
       if (assignedCopyId) {
-        this.assignCopyToNextEligibleReservationInternal(bookId, assignedCopyId, now);
+        this.assignCopyToNextEligibleReservationInternal(bookId, assignedCopyId, now, actor);
       }
 
       this.recalculateQueuePositionsInternal(bookId);
@@ -817,7 +959,8 @@ export class LibraryService {
     outcome: ReturnInspectionOutcome,
     physicalCondition: PhysicalCondition,
     notes?: string,
-    now: Date = new Date()
+    now: Date = new Date(),
+    actor?: AuditActor | null
   ): { loan: LoanRecord; assignedReservationId: string | null } {
     const tx = this.db.transaction(() => {
       this.expireOverdueReservationsInternal(now);
@@ -887,7 +1030,8 @@ export class LibraryService {
         assignedReservationId = this.assignCopyToNextEligibleReservationInternal(
           bookId,
           copyId,
-          now
+          now,
+          actor
         );
       }
 
@@ -903,6 +1047,15 @@ export class LibraryService {
         now
       );
 
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'LOAN_RETURNED',
+        'loan',
+        loanId,
+        `Retour validé pour « ${book?.title || 'Ouvrage'} » — décision : ${outcome}, état : ${physicalCondition}.`,
+        now
+      );
+
       return {
         loan: this.getLoanByIdInternal(loanId)!,
         assignedReservationId,
@@ -912,7 +1065,11 @@ export class LibraryService {
     return tx.immediate();
   }
 
-  public completeCopyRepair(copyId: string): Copy {
+  public completeCopyRepair(
+    copyId: string,
+    actor?: AuditActor | null,
+    now: Date = new Date()
+  ): Copy {
     const tx = this.db.transaction(() => {
       const copy = this.db
         .prepare(`SELECT * FROM copies WHERE id = ?`)
@@ -940,6 +1097,15 @@ export class LibraryService {
         )
         .run(copyId);
 
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'COPY_REPAIR_COMPLETED',
+        'copy',
+        copyId,
+        `Réparation terminée pour l'exemplaire ${String(copy.barcode)} — inspection requise avant remise en circulation.`,
+        now
+      );
+
       return this.getCopyByIdInternal(copyId)!;
     });
 
@@ -950,7 +1116,8 @@ export class LibraryService {
     copyId: string,
     outcome: ReturnInspectionOutcome,
     physicalCondition: PhysicalCondition,
-    now: Date = new Date()
+    now: Date = new Date(),
+    actor?: AuditActor | null
   ): { copy: Copy; assignedReservationId: string | null } {
     const tx = this.db.transaction(() => {
       this.expireOverdueReservationsInternal(now);
@@ -988,7 +1155,8 @@ export class LibraryService {
         assignedReservationId = this.assignCopyToNextEligibleReservationInternal(
           bookId,
           copyId,
-          now
+          now,
+          actor
         );
       } else if (outcome === 'endommage') {
         this.db
@@ -1014,6 +1182,15 @@ export class LibraryService {
           .run(copyId);
       }
 
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'COPY_INSPECTED',
+        'copy',
+        copyId,
+        `Inspection post-réparation de ${String(copy.barcode)} : ${outcome} (${physicalCondition}).`,
+        now
+      );
+
       return {
         copy: this.getCopyByIdInternal(copyId)!,
         assignedReservationId,
@@ -1023,7 +1200,147 @@ export class LibraryService {
     return tx.immediate();
   }
 
-  public fulfillReservationPickup(reservationId: string, now: Date = new Date()): LoanRecord {
+  public confirmReservationAvailability(
+    reservationId: string,
+    actor: AuditActor,
+    now: Date = new Date()
+  ): ReservationRecord {
+    const tx = this.db.transaction(() => {
+      this.syncOverdueLoansInternal(now);
+      this.expireOverdueReservationsInternal(now);
+
+      const res = this.db
+        .prepare(`SELECT * FROM reservations WHERE id = ?`)
+        .get(reservationId) as Record<string, unknown> | undefined;
+
+      if (!res) {
+        throw new DomainError('Réservation introuvable.', 404, 'RESERVATION_NOT_FOUND');
+      }
+
+      if (String(res.status) !== 'Exemplaire attribué' || !res.assignedCopyId) {
+        throw new DomainError(
+          'Seule une réservation au statut « Exemplaire attribué » peut être confirmée pour mise à disposition.',
+          409,
+          'RESERVATION_NOT_ALLOCATED'
+        );
+      }
+
+      const memberId = String(res.memberId);
+      const bookId = String(res.bookId);
+      const copyId = String(res.assignedCopyId);
+
+      // Vérifier l'éligibilité du membre au moment de la confirmation
+      this.assertEligibleInternal(memberId, now);
+
+      const nowIso = now.toISOString();
+      const pickupDeadline = addDaysIso(now, PICKUP_WINDOW_DAYS);
+
+      this.db
+        .prepare(
+          `UPDATE copies
+           SET status = 'Réservé', location = 'Banque d’accueil · Retrait réservations (3j)'
+           WHERE id = ?`
+        )
+        .run(copyId);
+
+      this.db
+        .prepare(
+          `UPDATE reservations
+           SET status = 'Disponible pour retrait',
+               availableAt = ?,
+               pickupDeadline = ?
+           WHERE id = ?`
+        )
+        .run(nowIso, pickupDeadline, reservationId);
+
+      const book = this.db
+        .prepare(`SELECT title FROM books WHERE id = ?`)
+        .get(bookId) as { title: string } | undefined;
+      const copy = this.db
+        .prepare(`SELECT barcode FROM copies WHERE id = ?`)
+        .get(copyId) as { barcode: string } | undefined;
+
+      this.insertNotificationInternal(
+        memberId,
+        'Ouvrage disponible pour retrait',
+        `Votre exemplaire de « ${book?.title || 'Ouvrage'} » (${copy?.barcode || ''}) est désormais disponible au guichet de la bibliothèque. Vous disposez de 3 jours pour le retirer, jusqu’au ${formatFrenchDateTime(pickupDeadline)}.`,
+        'retrait',
+        now
+      );
+
+      this.insertAuditLogInternal(
+        actor,
+        'RESERVATION_AVAILABILITY_CONFIRMED',
+        'reservation',
+        reservationId,
+        `Mise à disposition confirmée pour « ${book?.title || 'Ouvrage'} » (${copy?.barcode || ''}). Délai de retrait de 3 jours jusqu’au ${formatFrenchDateTime(pickupDeadline)}.`,
+        now
+      );
+
+      return this.getReservationByIdInternal(reservationId)!;
+    });
+
+    return tx.immediate();
+  }
+
+  public allocateAvailableCopyToQueueAdmin(
+    bookId: string,
+    actor: AuditActor,
+    now: Date = new Date()
+  ): { reservation: ReservationRecord; copy: Copy } {
+    const tx = this.db.transaction(() => {
+      this.syncOverdueLoansInternal(now);
+      this.expireOverdueReservationsInternal(now);
+
+      const availableCopy = this.db
+        .prepare(
+          `SELECT * FROM copies
+           WHERE bookId = ?
+             AND status = 'Disponible'
+             AND needsInspection = 0
+             AND physicalCondition NOT IN ('Endommagé', 'Hors service')
+           ORDER BY barcode ASC
+           LIMIT 1`
+        )
+        .get(bookId) as Record<string, unknown> | undefined;
+
+      if (!availableCopy) {
+        throw new DomainError(
+          'Aucun exemplaire disponible et inspecté pour cet ouvrage.',
+          409,
+          'NO_AVAILABLE_COPY'
+        );
+      }
+
+      const assignedId = this.assignCopyToNextEligibleReservationInternal(
+        bookId,
+        String(availableCopy.id),
+        now,
+        actor
+      );
+
+      if (!assignedId) {
+        throw new DomainError(
+          'Aucune réservation éligible en attente dans la file FIFO pour cet ouvrage.',
+          409,
+          'NO_ELIGIBLE_QUEUE_MEMBER'
+        );
+      }
+
+      return {
+        reservation: this.getReservationByIdInternal(assignedId)!,
+        copy: this.getCopyByIdInternal(String(availableCopy.id))!,
+      };
+    });
+
+    return tx.immediate();
+  }
+
+  public fulfillReservationPickup(
+    reservationId: string,
+    now: Date = new Date(),
+    actor?: AuditActor | null
+  ): LoanRecord {
     const tx = this.db.transaction(() => {
       this.syncOverdueLoansInternal(now);
       this.expireOverdueReservationsInternal(now);
@@ -1084,6 +1401,15 @@ export class LibraryService {
         now
       );
 
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'RESERVATION_PICKED_UP',
+        'loan',
+        loanId,
+        `Retrait de réservation ${reservationId} validé : prêt ${loanId} créé pour « ${book?.title || 'Ouvrage'} ».`,
+        now
+      );
+
       return this.getLoanByIdInternal(loanId)!;
     });
 
@@ -1117,7 +1443,12 @@ export class LibraryService {
          JOIN books b ON b.id = r.bookId
          LEFT JOIN copies c ON c.id = r.assignedCopyId
          WHERE r.memberId = ?
-         ORDER BY CASE WHEN r.status IN ('Disponible pour retrait', 'En attente') THEN 0 ELSE 1 END,
+         ORDER BY CASE
+                    WHEN r.status = 'Disponible pour retrait' THEN 0
+                    WHEN r.status = 'Exemplaire attribué' THEN 1
+                    WHEN r.status = 'En attente' THEN 2
+                    ELSE 3
+                  END,
                   r.requestedAt DESC`
       )
       .all(memberId) as Array<Record<string, unknown>>;
@@ -1182,6 +1513,7 @@ export class LibraryService {
       .prepare(
         `SELECT
           COALESCE(SUM(CASE WHEN status = 'En attente' THEN 1 ELSE 0 END), 0) as pending,
+          COALESCE(SUM(CASE WHEN status = 'Exemplaire attribué' THEN 1 ELSE 0 END), 0) as allocated,
           COALESCE(SUM(CASE WHEN status = 'Disponible pour retrait' THEN 1 ELSE 0 END), 0) as awaitingPickup
          FROM reservations`
       )
@@ -1205,6 +1537,7 @@ export class LibraryService {
       repairCopies: copyStats.repair || 0,
       withdrawnCopies: copyStats.withdrawn || 0,
       pendingReservations: resStats.pending || 0,
+      allocatedReservations: resStats.allocated || 0,
       awaitingPickupReservations: resStats.awaitingPickup || 0,
       overdueLoans: loanStats.overdueLoans || 0,
       activeLoans: loanStats.activeLoans || 0,
@@ -1242,11 +1575,12 @@ export class LibraryService {
          JOIN users u ON u.id = r.memberId
          LEFT JOIN copies c ON c.id = r.assignedCopyId
          ORDER BY CASE r.status
-                    WHEN 'Disponible pour retrait' THEN 0
-                    WHEN 'En attente' THEN 1
-                    ELSE 2
+                    WHEN 'Exemplaire attribué' THEN 0
+                    WHEN 'Disponible pour retrait' THEN 1
+                    WHEN 'En attente' THEN 2
+                    ELSE 3
                   END,
-                  r.requestedAt ASC`
+                  r.requestedAt ASC, r.rowid ASC, r.id ASC`
       )
       .all() as Array<Record<string, unknown>>;
 
@@ -1286,13 +1620,14 @@ export class LibraryService {
 
   public createBook(
     input: Omit<Book, 'id' | 'archived' | 'createdAt'>,
-    now: Date = new Date()
+    now: Date = new Date(),
+    actor?: AuditActor | null
   ): BookDetail {
     const id = this.generateId('bk');
     this.db
       .prepare(
-        `INSERT INTO books (id, title, authors, isbn, category, description, publisher, publicationYear, edition, language, coverImage, shelfLocation, archived, featured, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+        `INSERT INTO books (id, title, authors, isbn, category, description, publisher, publicationYear, edition, language, coverImage, shelfLocation, archived, featured, isDemo, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
       )
       .run(
         id,
@@ -1308,14 +1643,25 @@ export class LibraryService {
         input.coverImage,
         input.shelfLocation.trim(),
         input.featured ? 1 : 0,
+        input.isDemo ? 1 : 0,
         now.toISOString()
       );
+    this.insertAuditLogInternal(
+      actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+      'BOOK_CREATED',
+      'book',
+      id,
+      `Ouvrage « ${input.title.trim()} » ajouté au catalogue (${input.shelfLocation.trim()}).`,
+      now
+    );
     return this.getBookDetail(id, now);
   }
 
   public updateBook(
     bookId: string,
-    patch: Partial<Omit<Book, 'id' | 'createdAt'>>
+    patch: Partial<Omit<Book, 'id' | 'createdAt'>>,
+    actor?: AuditActor | null,
+    now: Date = new Date()
   ): BookDetail {
     const existing = this.db.prepare(`SELECT * FROM books WHERE id = ?`).get(bookId) as
       | Record<string, unknown>
@@ -1323,6 +1669,9 @@ export class LibraryService {
     if (!existing) {
       throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
     }
+
+    const nextTitle = patch.title !== undefined ? patch.title.trim() : String(existing.title);
+    const nextArchived = patch.archived !== undefined ? (patch.archived ? 1 : 0) : Number(existing.archived);
 
     this.db
       .prepare(
@@ -1333,7 +1682,7 @@ export class LibraryService {
          WHERE id = ?`
       )
       .run(
-        patch.title !== undefined ? patch.title.trim() : String(existing.title),
+        nextTitle,
         patch.authors !== undefined ? patch.authors.trim() : String(existing.authors),
         patch.isbn !== undefined ? (patch.isbn ? patch.isbn.trim() : null) : existing.isbn,
         patch.category !== undefined ? patch.category : String(existing.category),
@@ -1346,10 +1695,19 @@ export class LibraryService {
         patch.language !== undefined ? patch.language : String(existing.language),
         patch.coverImage !== undefined ? patch.coverImage : String(existing.coverImage),
         patch.shelfLocation !== undefined ? patch.shelfLocation.trim() : String(existing.shelfLocation),
-        patch.archived !== undefined ? (patch.archived ? 1 : 0) : Number(existing.archived),
+        nextArchived,
         patch.featured !== undefined ? (patch.featured ? 1 : 0) : Number(existing.featured),
         bookId
       );
+
+    this.insertAuditLogInternal(
+      actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+      'BOOK_UPDATED',
+      'book',
+      bookId,
+      `Notice de l’ouvrage « ${nextTitle} » mise à jour${nextArchived !== Number(existing.archived) ? (nextArchived ? ' (archivé)' : ' (désarchivé)') : ''}.`,
+      now
+    );
 
     return this.getBookDetail(bookId);
   }
@@ -1357,10 +1715,13 @@ export class LibraryService {
   public registerCopy(
     bookId: string,
     input: { barcode: string; physicalCondition: PhysicalCondition; location: string },
-    now: Date = new Date()
+    now: Date = new Date(),
+    actor?: AuditActor | null
   ): { copy: Copy; assignedReservationId: string | null } {
     const tx = this.db.transaction(() => {
-      const book = this.db.prepare(`SELECT id FROM books WHERE id = ?`).get(bookId);
+      const book = this.db.prepare(`SELECT id, title FROM books WHERE id = ?`).get(bookId) as
+        | { id: string; title: string }
+        | undefined;
       if (!book) {
         throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
       }
@@ -1398,12 +1759,22 @@ export class LibraryService {
           now.toISOString()
         );
 
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'COPY_REGISTERED',
+        'copy',
+        copyId,
+        `Nouvel exemplaire ${input.barcode.trim()} enregistré pour « ${book.title} » (${initialStatus}).`,
+        now
+      );
+
       let assignedReservationId: string | null = null;
       if (!isDamaged) {
         assignedReservationId = this.assignCopyToNextEligibleReservationInternal(
           bookId,
           copyId,
-          now
+          now,
+          actor
         );
       }
 
@@ -1421,7 +1792,8 @@ export class LibraryService {
     status: CopyStatus,
     physicalCondition: PhysicalCondition,
     location: string,
-    now: Date = new Date()
+    now: Date = new Date(),
+    actor?: AuditActor | null
   ): Copy {
     const tx = this.db.transaction(() => {
       const existing = this.db
@@ -1445,7 +1817,12 @@ export class LibraryService {
             `UPDATE copies SET physicalCondition = ?, location = ?, needsInspection = 0 WHERE id = ?`
           )
           .run(physicalCondition, location.trim(), copyId);
-        this.assignCopyToNextEligibleReservationInternal(String(existing.bookId), copyId, now);
+        this.assignCopyToNextEligibleReservationInternal(
+          String(existing.bookId),
+          copyId,
+          now,
+          actor
+        );
       } else {
         this.db
           .prepare(
@@ -1460,6 +1837,15 @@ export class LibraryService {
           );
       }
 
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'COPY_STATUS_UPDATED',
+        'copy',
+        copyId,
+        `Statut de l'exemplaire ${String(existing.barcode)} modifié : ${status} (${physicalCondition}).`,
+        now
+      );
+
       return this.getCopyByIdInternal(copyId)!;
     });
 
@@ -1467,21 +1853,40 @@ export class LibraryService {
   }
 
   public listMembersAdmin(): UserPublic[] {
-    return this.db
+    const rows = this.db
       .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
          FROM users
-         ORDER BY role DESC, fullName ASC`
+         ORDER BY isDemo ASC, role DESC, fullName ASC`
       )
-      .all() as UserPublic[];
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      id: String(row.id),
+      fullName: String(row.fullName),
+      email: String(row.email),
+      role: row.role as UserPublic['role'],
+      institution: String(row.institution),
+      studentStatus: row.studentStatus as StudentStatus,
+      accountStatus: row.accountStatus as AccountStatus,
+      cne: row.cne ? String(row.cne) : null,
+      filiere: row.filiere ? String(row.filiere) : null,
+      authSource: row.authSource as UserPublic['authSource'],
+      isDemo: Boolean(row.isDemo),
+      createdAt: String(row.createdAt),
+    }));
   }
 
   public updateMemberVerificationAdmin(
     userId: string,
     studentStatus: StudentStatus,
-    accountStatus: AccountStatus
+    accountStatus: AccountStatus,
+    actor?: AuditActor | null,
+    now: Date = new Date()
   ): UserPublic {
-    const existing = this.db.prepare(`SELECT id FROM users WHERE id = ?`).get(userId);
+    const existing = this.db
+      .prepare(`SELECT id, fullName, email FROM users WHERE id = ?`)
+      .get(userId) as { id: string; fullName: string; email: string } | undefined;
     if (!existing) {
       throw new DomainError('Utilisateur introuvable.', 404, 'USER_NOT_FOUND');
     }
@@ -1490,12 +1895,372 @@ export class LibraryService {
       .prepare(`UPDATE users SET studentStatus = ?, accountStatus = ? WHERE id = ?`)
       .run(studentStatus, accountStatus, userId);
 
-    return this.db
+    this.insertAuditLogInternal(
+      actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+      'MEMBER_VERIFICATION_UPDATED',
+      'user',
+      userId,
+      `Statut de ${existing.fullName} (${existing.email}) mis à jour : éligibilité=${studentStatus}, compte=${accountStatus}.`,
+      now
+    );
+
+    const row = this.db
       .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
          FROM users WHERE id = ?`
       )
-      .get(userId) as UserPublic;
+      .get(userId) as Record<string, unknown>;
+
+    return {
+      id: String(row.id),
+      fullName: String(row.fullName),
+      email: String(row.email),
+      role: row.role as UserPublic['role'],
+      institution: String(row.institution),
+      studentStatus: row.studentStatus as StudentStatus,
+      accountStatus: row.accountStatus as AccountStatus,
+      cne: row.cne ? String(row.cne) : null,
+      filiere: row.filiere ? String(row.filiere) : null,
+      authSource: row.authSource as UserPublic['authSource'],
+      isDemo: Boolean(row.isDemo),
+      createdAt: String(row.createdAt),
+    };
+  }
+
+  // --- Panier de demandes (ne réserve jamais d'exemplaire avant confirmation serveur) ---
+
+  public getCart(userId: string, now: Date = new Date()): CartItemRecord[] {
+    this.processDeadlines(now);
+    const rows = this.db
+      .prepare(
+        `SELECT ci.id as cartItemId, ci.bookId, ci.quantity, ci.addedAt, b.*
+         FROM cart_items ci
+         JOIN books b ON b.id = ci.bookId
+         WHERE ci.userId = ?
+         ORDER BY ci.addedAt ASC`
+      )
+      .all(userId) as Array<Record<string, unknown>>;
+
+    const copyStatsRows = this.db
+      .prepare(
+        `SELECT bookId,
+          COUNT(*) as allRows,
+          COALESCE(SUM(CASE WHEN status != 'Retiré définitivement' THEN 1 ELSE 0 END), 0) as totalPhysical,
+          COALESCE(SUM(CASE WHEN status = 'Disponible' AND needsInspection = 0 AND physicalCondition NOT IN ('Endommagé', 'Hors service') THEN 1 ELSE 0 END), 0) as available,
+          COALESCE(SUM(CASE WHEN status = 'Emprunté' THEN 1 ELSE 0 END), 0) as borrowed,
+          COALESCE(SUM(CASE WHEN status = 'Réservé' THEN 1 ELSE 0 END), 0) as reserved,
+          COALESCE(SUM(CASE WHEN status = 'En réparation' THEN 1 ELSE 0 END), 0) as repair,
+          COALESCE(SUM(CASE WHEN status = 'Retiré définitivement' THEN 1 ELSE 0 END), 0) as withdrawn
+         FROM copies
+         GROUP BY bookId`
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    const statsMap = new Map<string, Record<string, number>>();
+    for (const row of copyStatsRows) {
+      statsMap.set(String(row.bookId), {
+        totalPhysical: Number(row.totalPhysical || 0),
+        available: Number(row.available || 0),
+        borrowed: Number(row.borrowed || 0),
+        reserved: Number(row.reserved || 0),
+        repair: Number(row.repair || 0),
+        withdrawn: Number(row.withdrawn || 0),
+      });
+    }
+
+    return rows.map((row) => {
+      const bookId = String(row.bookId);
+      const st = statsMap.get(bookId) || {
+        totalPhysical: 0,
+        available: 0,
+        borrowed: 0,
+        reserved: 0,
+        repair: 0,
+        withdrawn: 0,
+      };
+      return {
+        id: String(row.cartItemId),
+        bookId,
+        quantity: Number(row.quantity),
+        addedAt: String(row.addedAt),
+        book: {
+          id: bookId,
+          title: String(row.title),
+          authors: String(row.authors),
+          isbn: row.isbn ? String(row.isbn) : null,
+          category: String(row.category),
+          description: String(row.description),
+          publisher: String(row.publisher),
+          publicationYear: Number(row.publicationYear),
+          edition: String(row.edition),
+          language: String(row.language),
+          coverImage: String(row.coverImage),
+          shelfLocation: String(row.shelfLocation),
+          archived: Boolean(row.archived),
+          featured: Boolean(row.featured),
+          isDemo: Boolean(row.isDemo),
+          createdAt: String(row.createdAt),
+          totalCopies: st.totalPhysical,
+          availableCopies: st.available,
+          borrowedCopies: st.borrowed,
+          reservedCopies: st.reserved,
+          repairCopies: st.repair,
+          withdrawnCopies: st.withdrawn,
+          circulatingCopies: st.totalPhysical,
+        },
+      };
+    });
+  }
+
+  public addToCart(
+    userId: string,
+    bookId: string,
+    quantity = 1,
+    now: Date = new Date()
+  ): CartItemRecord[] {
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      throw new DomainError('La quantité doit être égale à 1.', 400, 'INVALID_QUANTITY');
+    }
+    if (quantity > MAX_QUANTITY_PER_TITLE) {
+      throw new DomainError(
+        'Règlement BiblioEST : un membre ne peut demander qu’un seul exemplaire par titre.',
+        409,
+        'MAX_QUANTITY_PER_TITLE'
+      );
+    }
+
+    const book = this.db
+      .prepare(`SELECT id, archived FROM books WHERE id = ?`)
+      .get(bookId) as { id: string; archived: number } | undefined;
+
+    if (!book) {
+      throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
+    }
+    if (Boolean(book.archived)) {
+      throw new DomainError(
+        'Cet ouvrage est archivé et ne peut pas être ajouté au panier de demandes.',
+        409,
+        'BOOK_ARCHIVED'
+      );
+    }
+
+    const existing = this.db
+      .prepare(`SELECT id, quantity FROM cart_items WHERE userId = ? AND bookId = ?`)
+      .get(userId, bookId) as { id: string; quantity: number } | undefined;
+
+    if (existing) {
+      throw new DomainError(
+        'Cet ouvrage figure déjà dans votre panier de demandes (limite de 1 exemplaire par titre).',
+        409,
+        'MAX_QUANTITY_PER_TITLE'
+      );
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO cart_items (id, userId, bookId, quantity, addedAt)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(this.generateId('crt'), userId, bookId, MAX_QUANTITY_PER_TITLE, now.toISOString());
+
+    return this.getCart(userId, now);
+  }
+
+  public updateCartItemQuantity(
+    userId: string,
+    bookId: string,
+    quantity: number,
+    now: Date = new Date()
+  ): CartItemRecord[] {
+    if (!Number.isInteger(quantity) || quantity < 0) {
+      throw new DomainError('Quantité invalide.', 400, 'INVALID_QUANTITY');
+    }
+    if (quantity === 0) {
+      return this.removeFromCart(userId, bookId, now);
+    }
+    if (quantity > MAX_QUANTITY_PER_TITLE) {
+      throw new DomainError(
+        'Règlement BiblioEST : la quantité maximale autorisée est de 1 exemplaire par titre.',
+        409,
+        'MAX_QUANTITY_PER_TITLE'
+      );
+    }
+    return this.getCart(userId, now);
+  }
+
+  public removeFromCart(
+    userId: string,
+    bookId: string,
+    now: Date = new Date()
+  ): CartItemRecord[] {
+    this.db
+      .prepare(`DELETE FROM cart_items WHERE userId = ? AND bookId = ?`)
+      .run(userId, bookId);
+    return this.getCart(userId, now);
+  }
+
+  public clearCart(userId: string): void {
+    this.db.prepare(`DELETE FROM cart_items WHERE userId = ?`).run(userId);
+  }
+
+  public confirmCart(
+    memberId: string,
+    now: Date = new Date()
+  ): CartConfirmationResponse {
+    const tx = this.db.transaction(() => {
+      this.syncOverdueLoansInternal(now);
+      this.expireOverdueReservationsInternal(now);
+
+      const items = this.db
+        .prepare(
+          `SELECT ci.id, ci.bookId, ci.quantity, b.title as bookTitle
+           FROM cart_items ci
+           JOIN books b ON b.id = ci.bookId
+           WHERE ci.userId = ?
+           ORDER BY ci.addedAt ASC`
+        )
+        .all(memberId) as Array<{
+        id: string;
+        bookId: string;
+        quantity: number;
+        bookTitle: string;
+      }>;
+
+      if (items.length === 0) {
+        throw new DomainError('Votre panier de demandes est vide.', 400, 'EMPTY_CART');
+      }
+
+      const eligibility = this.checkEligibility(memberId, now);
+      const results: CartConfirmationItemResult[] = [];
+      let borrowedCount = 0;
+      let reservedCount = 0;
+      let refusedCount = 0;
+
+      for (const item of items) {
+        if (item.quantity > MAX_QUANTITY_PER_TITLE) {
+          refusedCount++;
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'refuse',
+            code: 'MAX_QUANTITY_PER_TITLE',
+            message: 'Quantité refusée : limite de 1 exemplaire par titre.',
+          });
+          continue;
+        }
+
+        if (!eligibility.eligible) {
+          refusedCount++;
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'refuse',
+            code: eligibility.reasonCode,
+            message: eligibility.reasonMessage,
+          });
+          continue;
+        }
+
+        try {
+          const loan = this.borrowBookInternal(memberId, item.bookId, now, null, {
+            id: memberId,
+            role: 'membre',
+          });
+          borrowedCount++;
+          this.db.prepare(`DELETE FROM cart_items WHERE id = ?`).run(item.id);
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'emprunt_enregistre',
+            message: `Emprunt enregistré pour 7 jours (exemplaire ${loan.copyBarcode}).`,
+            loan,
+          });
+        } catch (err) {
+          if (err instanceof DomainError && err.code === 'NO_AVAILABLE_COPY') {
+            try {
+              const reservation = this.reserveBookInternal(memberId, item.bookId, now, {
+                id: memberId,
+                role: 'membre',
+              });
+              reservedCount++;
+              this.db.prepare(`DELETE FROM cart_items WHERE id = ?`).run(item.id);
+              results.push({
+                bookId: item.bookId,
+                bookTitle: item.bookTitle,
+                outcome: 'reservation_enregistree',
+                message: `Aucun exemplaire libre : réservation FIFO #${reservation.queuePosition ?? 1} enregistrée. Aucune date de disponibilité n'est garantie.`,
+                reservation,
+              });
+            } catch (resErr) {
+              refusedCount++;
+              results.push({
+                bookId: item.bookId,
+                bookTitle: item.bookTitle,
+                outcome: 'refuse',
+                code: resErr instanceof DomainError ? resErr.code : 'RESERVATION_REFUSED',
+                message:
+                  resErr instanceof Error
+                    ? resErr.message
+                    : 'Impossible d’enregistrer la réservation.',
+              });
+            }
+          } else {
+            refusedCount++;
+            results.push({
+              bookId: item.bookId,
+              bookTitle: item.bookTitle,
+              outcome: 'refuse',
+              code: err instanceof DomainError ? err.code : 'REQUEST_REFUSED',
+              message:
+                err instanceof Error ? err.message : 'Demande refusée lors de la vérification serveur.',
+            });
+          }
+        }
+      }
+
+      this.insertAuditLogInternal(
+        { id: memberId, role: 'membre' },
+        'CART_CONFIRMED',
+        'cart',
+        memberId,
+        `Confirmation du panier : ${borrowedCount} emprunt(s), ${reservedCount} réservation(s), ${refusedCount} refus.`,
+        now
+      );
+
+      const remainingRow = this.db
+        .prepare(`SELECT COUNT(*) as cnt FROM cart_items WHERE userId = ?`)
+        .get(memberId) as { cnt: number };
+
+      return {
+        results,
+        remainingCartCount: remainingRow.cnt,
+      };
+    });
+
+    return tx.immediate();
+  }
+
+  public getAuditLogsAdmin(limit = 100): AuditLogRecord[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM audit_logs
+         ORDER BY createdAt DESC, rowid DESC
+         LIMIT ?`
+      )
+      .all(safeLimit) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      id: String(row.id),
+      actorId: row.actorId ? String(row.actorId) : null,
+      actorName: row.actorName ? String(row.actorName) : null,
+      actorRole: row.actorRole ? String(row.actorRole) : null,
+      action: String(row.action),
+      entityType: String(row.entityType),
+      entityId: String(row.entityId),
+      summary: String(row.summary),
+      createdAt: String(row.createdAt),
+    }));
   }
 
   private getCopyByIdInternal(copyId: string): Copy | null {

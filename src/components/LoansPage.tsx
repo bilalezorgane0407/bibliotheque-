@@ -47,7 +47,7 @@ export function LoansPage({
 
   if (!user) {
     return (
-      <div className="mx-auto max-w-3xl px-4 py-16 text-center">
+      <div className="mx-auto max-w-3xl px-4 py-14 text-center">
         <h1 className="font-editorial text-2xl font-semibold text-stone-950">
           Authentification requise
         </h1>
@@ -57,7 +57,7 @@ export function LoansPage({
         <button
           type="button"
           onClick={onRequireAuth}
-          className="mt-5 rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 cursor-pointer"
+          className="mt-5 min-h-[44px] rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 cursor-pointer"
         >
           Se connecter
         </button>
@@ -69,31 +69,38 @@ export function LoansPage({
   const pastLoans = loans.filter((l) => l.status === 'Retourné');
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6 lg:px-8">
-      <div className="border-b border-stone-200 pb-6">
+    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+      <div className="border-b border-stone-200 pb-5">
         <p className="text-xs font-semibold text-emerald-900">Dossier lecteur EST Fès</p>
-        <h1 className="mt-1 font-editorial text-3xl font-semibold text-stone-950">
+        <h1 className="mt-1 font-editorial text-2xl sm:text-3xl font-semibold text-stone-950">
           Mes emprunts
         </h1>
-        <p className="mt-2 text-sm text-stone-600">
+        <p className="mt-1.5 text-sm text-stone-600">
           Durée réglementaire de prêt : 7 jours. Tout retard bloque temporairement les nouveaux emprunts et réservations.
         </p>
       </div>
 
       {error && (
-        <div className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-900">
-          {error}
+        <div role="alert" className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-900">
+          <p>{error}</p>
+          <button
+            type="button"
+            onClick={() => void loadLoans()}
+            className="mt-3 min-h-[40px] rounded-lg bg-red-900 px-4 py-2 text-xs font-semibold text-white cursor-pointer"
+          >
+            Réessayer
+          </button>
         </div>
       )}
 
       {loading ? (
-        <div className="mt-8 space-y-4">
+        <div className="mt-6 space-y-3">
           {[0, 1].map((i) => (
             <div key={i} className="h-28 animate-pulse rounded-xl bg-stone-100" />
           ))}
         </div>
-      ) : loans.length === 0 ? (
-        <div className="mt-8 rounded-xl border border-stone-200 bg-white p-12 text-center">
+      ) : !error && loans.length === 0 ? (
+        <div className="mt-6 rounded-xl border border-stone-200 bg-white p-8 sm:p-12 text-center">
           <BookOpen className="mx-auto h-10 w-10 text-stone-400" />
           <h2 className="mt-3 font-editorial text-xl font-semibold text-stone-900">
             Aucun emprunt enregistré
@@ -104,13 +111,13 @@ export function LoansPage({
           <button
             type="button"
             onClick={onBrowseCatalogue}
-            className="mt-5 rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 cursor-pointer"
+            className="mt-5 min-h-[44px] rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 cursor-pointer"
           >
             Explorer le catalogue
           </button>
         </div>
-      ) : (
-        <div className="mt-8 space-y-10">
+      ) : !error ? (
+        <div className="mt-6 space-y-8">
           <section>
             <h2 className="font-editorial text-xl font-semibold text-stone-950">
               Emprunts en cours ({activeLoans.length})
@@ -124,59 +131,72 @@ export function LoansPage({
               <div className="mt-4 space-y-3">
                 {activeLoans.map((loan) => {
                   const daysLeft = daysRemainingFromNow(loan.dueAt);
-                  const isOverdue = loan.status === 'En retard' || (daysLeft !== null && daysLeft < 0);
+                  const isOverdue =
+                    loan.status === 'En retard' || (daysLeft !== null && daysLeft < 0);
                   return (
-                    <div
+                    <article
                       key={loan.id}
-                      className="flex flex-col gap-4 rounded-xl border border-stone-200 bg-white p-4 sm:flex-row sm:items-center sm:justify-between"
+                      className="rounded-xl border border-stone-200 bg-white p-4 space-y-3"
                     >
-                      <div className="flex items-start gap-4">
-                        <div className="h-20 w-15 shrink-0 overflow-hidden rounded-md border border-stone-200">
-                          <BookCover
-                            src={loan.bookCoverImage}
-                            alt={loan.bookTitle}
-                            title={loan.bookTitle}
-                            className="h-full w-full"
-                          />
-                        </div>
-                        <div>
-                          <button
-                            type="button"
-                            onClick={() => onOpenBook(loan.bookId)}
-                            className="text-left font-editorial text-lg font-semibold text-stone-900 hover:text-emerald-900 cursor-pointer"
-                          >
-                            {loan.bookTitle}
-                          </button>
-                          <p className="text-xs text-stone-600">{loan.bookAuthors}</p>
-                          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-stone-500 font-mono tabular-nums">
-                            <span>Exemplaire {loan.copyBarcode}</span>
-                            <span aria-hidden="true">·</span>
-                            <span>Emprunté le {formatDateFr(loan.borrowedAt)}</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="sm:text-right">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 pb-2.5">
                         {isOverdue ? (
-                          <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-700">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-700">
                             <AlertCircle className="h-4 w-4 shrink-0" />
-                            En retard (échéance {formatDateFr(loan.dueAt)})
-                          </div>
+                            En retard · Échéance {formatDateFr(loan.dueAt)}
+                          </span>
                         ) : (
-                          <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
                             <Clock className="h-4 w-4 shrink-0" />
-                            À rendre le {formatDateFr(loan.dueAt)}
-                          </div>
+                            En cours · À rendre le {formatDateFr(loan.dueAt)}
+                          </span>
                         )}
-                        <p className="mt-1 text-xs text-stone-500 tabular-nums">
+                        <span className="text-xs text-stone-500 tabular-nums">
                           {isOverdue
-                            ? 'Restitution attendue immédiatement à la banque d’accueil'
+                            ? 'Restitution immédiate requise'
                             : daysLeft === 0
                               ? 'Échéance aujourd’hui'
                               : `${daysLeft} jour${daysLeft && daysLeft > 1 ? 's' : ''} restant${daysLeft && daysLeft > 1 ? 's' : ''}`}
-                        </p>
+                        </span>
                       </div>
-                    </div>
+
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-start gap-3.5 min-w-0">
+                          <div className="h-20 w-15 shrink-0 overflow-hidden rounded-md border border-stone-200">
+                            <BookCover
+                              src={loan.bookCoverImage}
+                              alt={loan.bookTitle}
+                              title={loan.bookTitle}
+                              className="h-full w-full"
+                            />
+                          </div>
+                          <div className="min-w-0">
+                            <button
+                              type="button"
+                              onClick={() => onOpenBook(loan.bookId)}
+                              className="text-left font-editorial text-base sm:text-lg font-semibold text-stone-900 hover:text-emerald-900 cursor-pointer"
+                            >
+                              {loan.bookTitle}
+                            </button>
+                            <p className="text-xs text-stone-600">{loan.bookAuthors}</p>
+                            <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-stone-500 font-mono tabular-nums">
+                              <span>{loan.copyBarcode}</span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-sans">
+                                Emprunté le {formatDateFr(loan.borrowedAt)}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => onOpenBook(loan.bookId)}
+                          className="hidden sm:inline-flex min-h-[38px] shrink-0 items-center rounded-lg border border-stone-200 px-3 text-xs font-semibold text-stone-800 hover:border-emerald-800 cursor-pointer"
+                        >
+                          Voir la fiche
+                        </button>
+                      </div>
+                    </article>
                   );
                 })}
               </div>
@@ -188,7 +208,43 @@ export function LoansPage({
               <h2 className="font-editorial text-xl font-semibold text-stone-950">
                 Historique des emprunts restitués ({pastLoans.length})
               </h2>
-              <div className="mt-4 overflow-x-auto rounded-xl border border-stone-200">
+
+              {/* Cartes lisibles sur téléphone (zéro scroll horizontal) */}
+              <div className="mt-4 space-y-3 md:hidden">
+                {pastLoans.map((loan) => (
+                  <article
+                    key={loan.id}
+                    className="rounded-xl border border-stone-200 bg-white p-4 space-y-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-800 tabular-nums">
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                        Restitué le {formatDateFr(loan.returnedAt)}
+                      </span>
+                      <span className="font-mono text-xs text-stone-500">
+                        {loan.copyBarcode}
+                      </span>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => onOpenBook(loan.bookId)}
+                      className="text-left font-editorial text-base font-semibold text-stone-900 hover:text-emerald-900 cursor-pointer"
+                    >
+                      {loan.bookTitle}
+                    </button>
+
+                    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-stone-600 tabular-nums">
+                      <span>Emprunté le {formatDateFr(loan.borrowedAt)}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>État au retour : {loan.returnCondition || 'Bon état'}</span>
+                    </div>
+                  </article>
+                ))}
+              </div>
+
+              {/* Tableau structuré sur >= md */}
+              <div className="mt-4 hidden md:block rounded-xl border border-stone-200 overflow-x-auto">
                 <table className="w-full text-left text-sm">
                   <thead className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-700">
                     <tr>
@@ -234,7 +290,7 @@ export function LoansPage({
             </section>
           )}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

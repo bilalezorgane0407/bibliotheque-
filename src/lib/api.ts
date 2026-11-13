@@ -1,18 +1,21 @@
 import type {
   AccountStatus,
+  AuditLogRecord,
   Book,
   BookDetail,
   BookWithStats,
+  CartConfirmationResponse,
+  CartItemRecord,
   Copy,
   CopyStatus,
   DashboardStats,
   EligibilityReport,
+  GoogleAuthStatus,
   LoanRecord,
   NotificationRecord,
   PhysicalCondition,
   ReservationRecord,
   ReturnInspectionOutcome,
-  SsoAdapterStatus,
   StudentStatus,
   UserPublic,
 } from '../../shared/types.ts';
@@ -76,25 +79,37 @@ export const api = {
       cookieReceived?: boolean;
       user: UserPublic | null;
       eligibility: EligibilityReport;
-      sso: SsoAdapterStatus;
+      googleAuth: GoogleAuthStatus;
+      demoModeEnabled: boolean;
     }>('/api/auth/me'),
+
+  getGoogleAuthUrl: () =>
+    request<{ authorizationUrl: string }>('/api/auth/google/url'),
+
+  completeGoogleHandoff: (handoffToken: string) =>
+    request<{
+      authenticated: boolean;
+      user: UserPublic;
+      eligibility: EligibilityReport;
+      requiresLibrarianValidation?: boolean;
+    }>('/api/auth/google/handoff', {
+      method: 'POST',
+      body: JSON.stringify({ handoffToken }),
+    }),
+
+  demoLogin: (userId: string) =>
+    request<{ authenticated: boolean; user: UserPublic; eligibility: EligibilityReport }>(
+      '/api/auth/demo-login',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      }
+    ),
 
   login: (email: string, password: string) =>
     request<{ user: UserPublic; eligibility: EligibilityReport }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
-    }),
-
-  register: (payload: {
-    fullName: string;
-    email: string;
-    password: string;
-    cne?: string;
-    filiere?: string;
-  }) =>
-    request<{ user: UserPublic; eligibility: EligibilityReport }>('/api/auth/register', {
-      method: 'POST',
-      body: JSON.stringify(payload),
     }),
 
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
@@ -152,6 +167,30 @@ export const api = {
   markAllNotificationsRead: () =>
     request<{ ok: boolean }>('/api/notifications/read-all', { method: 'POST' }),
 
+  // Panier de demandes (ne réserve jamais d'exemplaire avant confirmation serveur)
+  getCart: () =>
+    request<{ items: CartItemRecord[]; maxQuantityPerTitle: number }>('/api/cart'),
+
+  addToCart: (bookId: string, quantity = 1) =>
+    request<{ items: CartItemRecord[] }>('/api/cart/items', {
+      method: 'POST',
+      body: JSON.stringify({ bookId, quantity }),
+    }),
+
+  updateCartItemQuantity: (bookId: string, quantity: number) =>
+    request<{ items: CartItemRecord[] }>(`/api/cart/items/${encodeURIComponent(bookId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ quantity }),
+    }),
+
+  removeFromCart: (bookId: string) =>
+    request<{ items: CartItemRecord[] }>(`/api/cart/items/${encodeURIComponent(bookId)}`, {
+      method: 'DELETE',
+    }),
+
+  confirmCart: () =>
+    request<CartConfirmationResponse>('/api/cart/confirm', { method: 'POST' }),
+
   // Administration bibliothécaire
   adminGetStats: () => request<{ stats: DashboardStats }>('/api/admin/stats'),
 
@@ -208,6 +247,16 @@ export const api = {
 
   adminGetLoans: () => request<{ loans: LoanRecord[] }>('/api/admin/loans'),
 
+  adminCreateLoan: (payload: {
+    memberId: string;
+    bookId: string;
+    copyId?: string | null;
+  }) =>
+    request<{ loan: LoanRecord }>('/api/admin/loans', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
   adminReturnLoan: (
     loanId: string,
     payload: {
@@ -223,6 +272,18 @@ export const api = {
 
   adminGetReservations: () =>
     request<{ reservations: ReservationRecord[] }>('/api/admin/reservations'),
+
+  adminAllocateQueue: (bookId: string) =>
+    request<{ reservation: ReservationRecord; copy: Copy }>(
+      '/api/admin/reservations/allocate',
+      { method: 'POST', body: JSON.stringify({ bookId }) }
+    ),
+
+  adminConfirmReservationAvailability: (reservationId: string) =>
+    request<{ reservation: ReservationRecord }>(
+      `/api/admin/reservations/${encodeURIComponent(reservationId)}/confirm-availability`,
+      { method: 'POST' }
+    ),
 
   adminPickupReservation: (reservationId: string) =>
     request<{ loan: LoanRecord }>(
@@ -252,6 +313,9 @@ export const api = {
       `/api/admin/members/${encodeURIComponent(userId)}/verification`,
       { method: 'PATCH', body: JSON.stringify({ studentStatus, accountStatus }) }
     ),
+
+  adminGetAuditLogs: (limit = 100) =>
+    request<{ logs: AuditLogRecord[] }>(`/api/admin/audit-logs?limit=${limit}`),
 };
 
 export function formatDateFr(iso: string | null | undefined): string {

@@ -4,7 +4,7 @@ export type StudentStatus = 'verifie' | 'en_attente' | 'non_est' | 'suspendu';
 
 export type AccountStatus = 'actif' | 'suspendu';
 
-export type AuthSource = 'local' | 'usmba_sso';
+export type AuthSource = 'local' | 'usmba_sso' | 'google_oidc';
 
 export type CopyStatus =
   | 'Disponible'
@@ -24,6 +24,7 @@ export type LoanStatus = 'En cours' | 'Retourné' | 'En retard';
 
 export type ReservationStatus =
   | 'En attente'
+  | 'Exemplaire attribué'
   | 'Disponible pour retrait'
   | 'Retirée'
   | 'Annulée'
@@ -45,6 +46,7 @@ export interface UserPublic {
   cne: string | null;
   filiere: string | null;
   authSource: AuthSource;
+  isDemo?: boolean;
   createdAt: string;
 }
 
@@ -79,6 +81,7 @@ export interface Book {
   shelfLocation: string;
   archived: boolean;
   featured: boolean;
+  isDemo?: boolean;
   createdAt: string;
 }
 
@@ -163,14 +166,57 @@ export interface NotificationRecord {
   readAt: string | null;
 }
 
-export interface SsoAdapterStatus {
-  provider: string;
-  protocol: 'OIDC / CAS USMBA';
-  configured: boolean;
-  issuerUrl: string | null;
-  authorizationEndpoint: string | null;
+export interface CartItemRecord {
+  id: string;
+  bookId: string;
+  quantity: number;
+  addedAt: string;
+  book: BookWithStats;
+}
+
+export type CartConfirmationOutcome =
+  | 'emprunt_enregistre'
+  | 'reservation_enregistree'
+  | 'refuse';
+
+export interface CartConfirmationItemResult {
+  bookId: string;
+  bookTitle: string;
+  outcome: CartConfirmationOutcome;
   message: string;
-  documentationPath: string;
+  code?: string;
+  loan?: LoanRecord;
+  reservation?: ReservationRecord;
+}
+
+export interface CartConfirmationResponse {
+  results: CartConfirmationItemResult[];
+  remainingCartCount: number;
+}
+
+export interface AuditLogRecord {
+  id: string;
+  actorId: string | null;
+  actorName: string | null;
+  actorRole: string | null;
+  action: string;
+  entityType: string;
+  entityId: string;
+  summary: string;
+  createdAt: string;
+}
+
+export interface GoogleAuthStatus {
+  provider: string;
+  configured: boolean;
+  clientIdConfigured: boolean;
+  redirectUri: string;
+  sharedRedirectUri: string | null;
+  allowedDomain: string | null;
+  eligibilitySourceConfigured: boolean;
+  missingVariables: string[];
+  recoveryUrl: string;
+  message: string;
 }
 
 export interface DashboardStats {
@@ -182,6 +228,7 @@ export interface DashboardStats {
   repairCopies: number;
   withdrawnCopies: number;
   pendingReservations: number;
+  allocatedReservations: number;
   awaitingPickupReservations: number;
   overdueLoans: number;
   activeLoans: number;
@@ -199,3 +246,4 @@ export const BOOK_LANGUAGES = ['Français', 'Anglais', 'Arabe'] as const;
 
 export const BORROWING_DURATION_DAYS = 7;
 export const PICKUP_WINDOW_DAYS = 3;
+export const MAX_QUANTITY_PER_TITLE = 1;
