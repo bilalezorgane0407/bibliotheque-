@@ -208,6 +208,12 @@ export const api = {
 
   adminGetLoans: () => request<{ loans: LoanRecord[] }>('/api/admin/loans'),
 
+  adminSendOverdueReminders: () =>
+    request<{ acceptedCount: number; failedCount: number; skippedCount: number }>(
+      '/api/admin/overdue-reminders',
+      { method: 'POST' }
+    ),
+
   adminReturnLoan: (
     loanId: string,
     payload: {

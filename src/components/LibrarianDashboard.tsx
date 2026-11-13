@@ -7,6 +7,7 @@ import {
   ClipboardCheck,
   Clock,
   Edit3,
+  Mail,
   Plus,
   RefreshCw,
   ShieldAlert,
@@ -67,6 +68,8 @@ interface LibrarianDashboardProps {
 
 export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardProps) {
   const [tab, setTab] = useState<AdminTab>('overview');
+  const [showOnlyOverdue, setShowOnlyOverdue] = useState(false);
+  const [sendingOverdueReminders, setSendingOverdueReminders] = useState(false);
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [books, setBooks] = useState<BookWithStats[]>([]);
   const [copies, setCopies] = useState<Array<Copy & { bookTitle: string; bookCategory: string }>>([]);
@@ -329,6 +332,48 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
     }
   };
 
+  const openOverdueLoans = () => {
+    setShowOnlyOverdue(true);
+    setTab('loans');
+  };
+
+  const handleSendOverdueReminders = async () => {
+    const overdue = loans.filter((loan) => loan.status === 'En retard');
+    const recipientCount = new Set(
+      overdue.filter((loan) => Boolean(loan.memberEmail?.trim())).map((loan) => loan.memberId)
+    ).size;
+
+    if (recipientCount === 0) {
+      setBanner('Aucun membre avec une adresse e-mail valide à notifier.');
+      setError(null);
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Envoyer un e-mail de rappel à ${recipientCount} membre(s), avec le récapitulatif de leurs emprunts en retard ?`
+    );
+    if (!confirmed) return;
+
+    setSendingOverdueReminders(true);
+    setError(null);
+    setBanner(null);
+    try {
+      const result = await api.adminSendOverdueReminders();
+      const summary = [`${result.acceptedCount} message(s) accepté(s) pour envoi`];
+      if (result.failedCount > 0) summary.push(`${result.failedCount} échec(s)`);
+      if (result.skippedCount > 0) summary.push(`${result.skippedCount} adresse(s) ignorée(s)`);
+      setBanner(`${summary.join(' · ')}.`);
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : 'Impossible d’envoyer les rappels par e-mail.'
+      );
+    } finally {
+      setSendingOverdueReminders(false);
+    }
+  };
+
   const handleUpdateMember = async (
     memberId: string,
     studentStatus: StudentStatus,
@@ -355,6 +400,15 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
       total: depBooks.reduce((s, b) => s + b.totalCopies, 0),
     };
   });
+  const displayedLoans = showOnlyOverdue
+    ? loans.filter((loan) => loan.status === 'En retard')
+    : loans;
+  const overdueRecipientCount = new Set(
+    loans
+      .filter((loan) => loan.status === 'En retard')
+      .filter((loan) => Boolean(loan.memberEmail?.trim()))
+      .map((loan) => loan.memberId)
+  ).size;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
@@ -416,12 +470,17 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
             </div>
             <div className="mt-0.5 text-[11px] text-stone-600">Prêts à retirer</div>
           </div>
-          <div className="rounded-xl border border-stone-200 bg-white p-3.5">
+          <button
+            type="button"
+            onClick={openOverdueLoans}
+            aria-label={`Afficher les ${stats.overdueLoans} emprunts en retard`}
+            className="rounded-xl border border-red-200 bg-white p-3.5 text-left transition-colors hover:border-red-400 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-700"
+          >
             <div className="font-mono text-xl font-semibold text-red-700 tabular-nums">
               {stats.overdueLoans}
             </div>
             <div className="mt-0.5 text-[11px] text-stone-600">Emprunts en retard</div>
-          </div>
+          </button>
           <div className="rounded-xl border border-stone-200 bg-white p-3.5">
             <div className="font-mono text-xl font-semibold text-stone-800 tabular-nums">
               {stats.repairCopies}
@@ -522,7 +581,7 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
                       </span>
                       <button
                         type="button"
-                        onClick={() => setTab('loans')}
+                        onClick={openOverdueLoans}
                         className="font-mono text-xs font-semibold text-emerald-900 underline cursor-pointer tabular-nums"
                       >
                         {stats?.overdueLoans || 0} dossier(s)
@@ -980,10 +1039,72 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
           {/* 4. EMPRUNTS & RETOURS AVEC INSPECTION */}
           {tab === 'loans' && (
             <div className="space-y-4">
-              <h2 className="font-editorial text-xl font-semibold text-stone-950">
-                Suivi des emprunts et enregistrement des retours ({loans.length})
-              </h2>
-              <div className="overflow-x-auto rounded-xl border border-stone-200 bg-white">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h2 className="font-editorial text-xl font-semibold text-stone-950">
+                  {showOnlyOverdue
+                    ? 'Emprunts en retard'
+                    : 'Suivi des emprunts et enregistrement des retours'}{' '}
+                  ({displayedLoans.length})
+                </h2>
+                {showOnlyOverdue && (
+                  <button
+                    type="button"
+                    onClick={() => setShowOnlyOverdue(false)}
+                    className="text-xs font-semibold text-emerald-900 underline cursor-pointer"
+                  >
+                    Afficher tous les emprunts
+                  </button>
+                )}
+              </div>
+              {displayedLoans.length === 0 ? (
+                <div className="rounded-xl border border-stone-200 bg-white px-5 py-10 text-center text-sm text-stone-600">
+                  {showOnlyOverdue ? 'Aucun emprunt en retard.' : 'Aucun emprunt à afficher.'}
+                </div>
+              ) : (
+                <>
+                  {showOnlyOverdue && (
+                    <div className="space-y-3 md:hidden">
+                      {displayedLoans.map((loan) => (
+                        <article
+                          key={loan.id}
+                          className="rounded-xl border border-red-200 bg-white p-4 shadow-xs"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <h3 className="font-semibold text-stone-950">{loan.memberName}</h3>
+                              <p className="break-all text-xs text-stone-600">{loan.memberEmail}</p>
+                            </div>
+                            <span className="shrink-0 rounded-full bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-800">
+                              En retard
+                            </span>
+                          </div>
+                          <p className="mt-3 text-sm font-medium text-stone-900">{loan.bookTitle}</p>
+                          <p className="mt-1 font-mono text-xs text-stone-500">{loan.copyBarcode}</p>
+                          <div className="mt-3 flex items-center justify-between gap-3 border-t border-stone-100 pt-3">
+                            <span className="text-xs text-stone-600">
+                              Échéance : {formatDateFr(loan.dueAt)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReturningLoan(loan);
+                                setReturnOutcome('reutilisable');
+                                setReturnCondition('Bon état');
+                                setReturnNotes('');
+                              }}
+                              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-emerald-900 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-800"
+                            >
+                              <ClipboardCheck className="h-3.5 w-3.5" />
+                              Enregistrer retour
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                  <div
+                    className={`${showOnlyOverdue ? 'hidden md:block' : ''} overflow-x-auto rounded-xl border border-stone-200 bg-white`}
+                  >
                 <table className="w-full text-left text-sm">
                   <thead className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-700">
                     <tr>
@@ -995,7 +1116,7 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-stone-100">
-                    {loans.map((l) => (
+                    {displayedLoans.map((l) => (
                       <tr key={l.id}>
                         <td className="px-4 py-3">
                           <div className="font-medium text-stone-900">{l.memberName}</div>
@@ -1048,7 +1169,27 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
                     ))}
                   </tbody>
                 </table>
-              </div>
+                  </div>
+                </>
+              )}
+              {showOnlyOverdue && displayedLoans.length > 0 && (
+                <div className="flex flex-col gap-3 rounded-xl border border-red-100 bg-red-50/60 p-4 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-stone-700">
+                    Un message récapitulatif sera envoyé à chaque membre concerné, une seule fois par membre.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void handleSendOverdueReminders()}
+                    disabled={sendingOverdueReminders || overdueRecipientCount === 0}
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-emerald-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Mail className="h-4 w-4" />
+                    {sendingOverdueReminders
+                      ? 'Envoi en cours…'
+                      : `Notifier les membres par e-mail (${overdueRecipientCount})`}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

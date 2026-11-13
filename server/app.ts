@@ -17,6 +17,7 @@ import { DomainError, LibraryService } from './services/libraryService.ts';
 import type {
   AccountStatus,
   CopyStatus,
+  LoanRecord,
   PhysicalCondition,
   ReturnInspectionOutcome,
   StudentStatus,
@@ -466,6 +467,102 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.get('/api/admin/loans', requireLibrarian, (_req, res) => {
     res.json({ loans: service.getAllLoansAdmin(getNow()) });
+  });
+
+  app.post('/api/admin/overdue-reminders', requireLibrarian, async (_req, res, next) => {
+    try {
+      const apiKey = process.env.RESEND_API_KEY?.trim();
+      const from = process.env.EMAIL_FROM?.trim();
+      if (process.env.EMAIL_SEND_ENABLED !== 'true' || !apiKey || !from) {
+        res.status(503).json({
+          error:
+            'L’envoi d’e-mails n’est pas configuré. Ajoutez RESEND_API_KEY et EMAIL_FROM dans les secrets du serveur, puis activez EMAIL_SEND_ENABLED.',
+          code: 'EMAIL_SENDING_NOT_CONFIGURED',
+        });
+        return;
+      }
+
+      const overdueLoans = service
+        .getAllLoansAdmin(getNow())
+        .filter((loan) => loan.status === 'En retard');
+      const recipients = new Map<string, { name: string; email: string; loans: LoanRecord[] }>();
+      const skippedMembers = new Set<string>();
+
+      for (const loan of overdueLoans) {
+        const email = loan.memberEmail?.trim();
+        const normalizedEmail = email?.toLowerCase();
+        const emailDomain = normalizedEmail?.split('@')[1] || '';
+        if (
+          !email ||
+          !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+          /\.(example|test|invalid|localhost)$/.test(emailDomain)
+        ) {
+          skippedMembers.add(loan.memberId);
+          continue;
+        }
+
+        const recipient = recipients.get(loan.memberId) || {
+          name: loan.memberName || 'Membre',
+          email,
+          loans: [],
+        };
+        recipient.loans.push(loan);
+        recipients.set(loan.memberId, recipient);
+      }
+
+      let acceptedCount = 0;
+      let failedCount = 0;
+      const dateKey = getNow().toISOString().slice(0, 10);
+      for (const [memberId, recipient] of recipients) {
+        const loanLines = recipient.loans.map((loan) => {
+          const dueDate = new Intl.DateTimeFormat('fr-FR', {
+            dateStyle: 'long',
+            timeZone: 'Africa/Casablanca',
+          }).format(new Date(loan.dueAt));
+          return `- « ${loan.bookTitle} » (code ${loan.copyBarcode}), échéance le ${dueDate}`;
+        });
+        const text = [
+          `Bonjour ${recipient.name},`,
+          '',
+          'Selon nos registres, le ou les emprunts suivants sont en retard :',
+          ...loanLines,
+          '',
+          'Merci de rapporter ces ouvrages à la bibliothèque de l’EST Fès. Si vous les avez déjà rendus, vous pouvez ignorer ce message ou contacter le personnel de la bibliothèque.',
+          '',
+          'Bibliothèque de l’EST Fès · USMBA',
+        ].join('\n');
+        const idempotencyKey = crypto
+          .createHash('sha256')
+          .update(`${memberId}:${dateKey}:${recipient.loans.map((loan) => loan.id).sort().join(',')}`)
+          .digest('hex');
+
+        try {
+          const response = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+              'Idempotency-Key': idempotencyKey,
+            },
+            body: JSON.stringify({
+              from,
+              to: [recipient.email],
+              subject: 'Rappel : emprunt(s) en retard — Bibliothèque EST Fès',
+              text,
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+          if (response.ok) acceptedCount += 1;
+          else failedCount += 1;
+        } catch {
+          failedCount += 1;
+        }
+      }
+
+      res.json({ acceptedCount, failedCount, skippedCount: skippedMembers.size });
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.post('/api/admin/loans/:id/return', requireLibrarian, (req, res, next) => {
