@@ -70,6 +70,7 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
   const [tab, setTab] = useState<AdminTab>('overview');
   const [showOnlyOverdue, setShowOnlyOverdue] = useState(false);
   const [sendingOverdueReminders, setSendingOverdueReminders] = useState(false);
+  const [sendingEmailTest, setSendingEmailTest] = useState(false);
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [books, setBooks] = useState<BookWithStats[]>([]);
   const [copies, setCopies] = useState<Array<Copy & { bookTitle: string; bookCategory: string }>>([]);
@@ -371,6 +372,20 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
       );
     } finally {
       setSendingOverdueReminders(false);
+    }
+  };
+
+  const handleSendEmailTest = async () => {
+    setSendingEmailTest(true);
+    setError(null);
+    setBanner(null);
+    try {
+      await api.adminSendEmailTest();
+      setBanner('Message de test accepté par le fournisseur. Vérifiez la boîte de réception et les courriers indésirables de l’adresse configurée. Aucun membre n’a été contacté.');
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Impossible d’envoyer le message de test.');
+    } finally {
+      setSendingEmailTest(false);
     }
   };
 
@@ -1187,6 +1202,20 @@ export function LibrarianDashboard({ user, onDataMutated }: LibrarianDashboardPr
                     {sendingOverdueReminders
                       ? 'Envoi en cours…'
                       : `Notifier les membres par e-mail (${overdueRecipientCount})`}
+                  </button>
+                </div>
+              )}
+              {showOnlyOverdue && (
+                <div className="flex flex-col gap-3 rounded-xl border border-stone-200 bg-white p-4 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-stone-600">Vérifiez d’abord l’expéditeur avec un seul e-mail envoyé à l’adresse de test configurée.</p>
+                  <button
+                    type="button"
+                    onClick={() => void handleSendEmailTest()}
+                    disabled={sendingEmailTest}
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-emerald-900 px-4 py-2.5 text-sm font-semibold text-emerald-900 hover:bg-emerald-50 disabled:cursor-wait disabled:opacity-50"
+                  >
+                    <Mail className="h-4 w-4" />
+                    {sendingEmailTest ? 'Envoi du test…' : 'Envoyer un e-mail de test'}
                   </button>
                 </div>
               )}

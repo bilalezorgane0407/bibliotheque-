@@ -254,7 +254,7 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
 
               <div>
                 <label htmlFor="reg-email" className="block text-sm font-medium text-stone-800">
-                  Adresse e-mail USMBA
+                  Adresse e-mail académique (fournie par l’établissement)
                 </label>
                 <input
                   id="reg-email"
@@ -265,6 +265,7 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
                   placeholder="prenom.nom@usmba.ac.ma"
                   className="mt-1.5 w-full rounded-lg border border-stone-300 px-3.5 py-2.5 text-sm focus:border-emerald-800 focus:outline-none focus:ring-2 focus:ring-emerald-800/15"
                 />
+                <p className="mt-1.5 text-xs text-stone-500">Utilisez votre adresse institutionnelle existante. L’inscription crée votre compte BiblioEST, pas une boîte e-mail.</p>
               </div>
 
               <div className="grid gap-4 sm:grid-cols-2">

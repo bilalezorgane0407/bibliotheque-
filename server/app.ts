@@ -156,7 +156,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     const normalizedEmail = email.trim().toLowerCase();
     if (!normalizedEmail.endsWith('@usmba.ac.ma') && !normalizedEmail.endsWith('@est-usmba.ac.ma')) {
       res.status(400).json({
-        error: 'Seules les adresses universitaires USMBA (@usmba.ac.ma) sont acceptées.',
+        error: 'Utilisez une adresse académique institutionnelle @usmba.ac.ma ou @est-usmba.ac.ma.',
       });
       return;
     }
@@ -473,10 +473,15 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     try {
       const apiKey = process.env.RESEND_API_KEY?.trim();
       const from = process.env.EMAIL_FROM?.trim();
-      if (process.env.EMAIL_SEND_ENABLED !== 'true' || !apiKey || !from) {
+      if (
+        process.env.EMAIL_SEND_ENABLED !== 'true' ||
+        process.env.EMAIL_BULK_REMINDERS_ENABLED !== 'true' ||
+        !apiKey ||
+        !from
+      ) {
         res.status(503).json({
           error:
-            'L’envoi d’e-mails n’est pas configuré. Ajoutez RESEND_API_KEY et EMAIL_FROM dans les secrets du serveur, puis activez EMAIL_SEND_ENABLED.',
+            'L’envoi groupé est désactivé. Configurez les secrets du serveur et activez explicitement EMAIL_BULK_REMINDERS_ENABLED après le test.',
           code: 'EMAIL_SENDING_NOT_CONFIGURED',
         });
         return;
@@ -560,6 +565,62 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       }
 
       res.json({ acceptedCount, failedCount, skippedCount: skippedMembers.size });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Envoi de contrôle isolé : aucun message n'est adressé aux membres.
+  app.post('/api/admin/email-test', requireLibrarian, async (_req, res, next) => {
+    try {
+      const apiKey = process.env.RESEND_API_KEY?.trim();
+      const from = process.env.EMAIL_FROM?.trim();
+      const recipient = process.env.EMAIL_TEST_RECIPIENT?.trim();
+      if (process.env.EMAIL_SEND_ENABLED !== 'true' || !apiKey || !from || !recipient) {
+        res.status(503).json({
+          error:
+            'Configurez EMAIL_SEND_ENABLED=true, RESEND_API_KEY, EMAIL_FROM et EMAIL_TEST_RECIPIENT dans les secrets du serveur.',
+          code: 'EMAIL_SENDING_NOT_CONFIGURED',
+        });
+        return;
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+        res.status(503).json({
+          error: 'EMAIL_TEST_RECIPIENT doit contenir une adresse e-mail valide.',
+          code: 'INVALID_EMAIL_TEST_RECIPIENT',
+        });
+        return;
+      }
+
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `biblioest-test:${crypto.createHash('sha256').update(recipient.toLowerCase()).digest('hex')}:${getNow().toISOString().slice(0, 13)}`,
+        },
+        body: JSON.stringify({
+          from,
+          to: [recipient],
+          subject: 'Test d’envoi — Bibliothèque EST Fès',
+          text: [
+            'Bonjour,',
+            '',
+            'Ceci est un message de test de la configuration e-mail de la Bibliothèque EST Fès.',
+            'Aucun rappel de retard n’a été envoyé aux membres.',
+            '',
+            'Bibliothèque de l’EST Fès · USMBA',
+          ].join('\n'),
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) {
+        const providerError = await response.text();
+        console.error('[email:test] provider rejected request', { status: response.status, providerError });
+        res.status(502).json({ error: 'Le fournisseur e-mail a refusé le message de test.', code: 'EMAIL_PROVIDER_REJECTED' });
+        return;
+      }
+      res.json({ accepted: true });
     } catch (err) {
       next(err);
     }

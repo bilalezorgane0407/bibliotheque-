@@ -214,6 +214,9 @@ export const api = {
       { method: 'POST' }
     ),
 
+  adminSendEmailTest: () =>
+    request<{ accepted: boolean }>('/api/admin/email-test', { method: 'POST' }),
+
   adminReturnLoan: (
     loanId: string,
     payload: {
