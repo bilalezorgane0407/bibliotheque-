@@ -1,0 +1,6 @@
+{
+  "name": "BiblioEST",
+  "description": "Système de gestion de la bibliothèque universitaire de l'École Supérieure de Technologie de Fès (EST Fès – Université Sidi Mohamed Ben Abdellah).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
