@@ -92,9 +92,21 @@ export const api = {
     cne?: string;
     filiere?: string;
   }) =>
-    request<{ user: UserPublic; eligibility: EligibilityReport }>('/api/auth/register', {
+    request<{ verificationRequired: true; email: string }>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+
+  verifyRegistrationEmail: (email: string, code: string) =>
+    request<{ user: UserPublic; eligibility: EligibilityReport }>('/api/auth/register/verify', {
+      method: 'POST',
+      body: JSON.stringify({ email, code }),
+    }),
+
+  resendRegistrationCode: (email: string) =>
+    request<{ sent: boolean }>('/api/auth/register/resend', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
     }),
 
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),

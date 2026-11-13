@@ -11,33 +11,35 @@ interface AuthViewProps {
 const DEMO_ACCOUNTS = [
   {
     label: 'Salma Bennani — Étudiante EST Fès vérifiée et éligible',
-    email: 'salma.bennani@usmba.ac.ma',
+    email: 'salma.demo@usmba.example',
     pass: 'EtudiantEST2026!',
   },
   {
     label: 'Bilale Zorgane — Étudiant EST Fès vérifié et éligible',
-    email: 'bilale.zorgane@usmba.ac.ma',
+    email: 'bilale.demo@usmba.example',
     pass: 'EtudiantEST2026!',
   },
   {
     label: 'Youssef El Alaoui — Étudiant avec emprunt en retard (bloqué)',
-    email: 'youssef.alaoui@usmba.ac.ma',
+    email: 'youssef.demo@usmba.example',
     pass: 'EtudiantEST2026!',
   },
   {
     label: 'Karim Tazi — Statut EST Fès non vérifié (bloqué)',
-    email: 'karim.tazi@usmba.ac.ma',
+    email: 'karim.demo@usmba.example',
     pass: 'EtudiantEST2026!',
   },
   {
     label: 'Nadia Benjelloun — Bibliothécaire EST Fès (administration)',
-    email: 'bibliothecaire@est-usmba.ac.ma',
+    email: 'bibliothecaire.demo@est-usmba.example',
     pass: 'BiblioAdmin2026!',
   },
 ];
 
 export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [verificationPending, setVerificationPending] = useState(false);
+  const [verificationCode, setVerificationCode] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
@@ -78,8 +80,12 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
     setInfoMsg(null);
     setSubmitting(true);
     try {
-      await api.register({ fullName, email, password, cne, filiere });
-      await onAuthenticated();
+      const normalizedEmail = email.trim().toLowerCase();
+      await api.register({ fullName, email: normalizedEmail, password, cne, filiere });
+      setEmail(normalizedEmail);
+      setVerificationPending(true);
+      setVerificationCode('');
+      setInfoMsg(`Un code à 6 chiffres a été envoyé à ${normalizedEmail}. Il est valable 10 minutes.`);
     } catch (err) {
       if (err instanceof ApiError && err.code === 'IFRAME_COOKIE_BLOCKED') {
         setIframeCookieBlocked(true);
@@ -89,6 +95,38 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
           ? err.message
           : 'Erreur lors de la création du compte.'
       );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleVerifyRegistration = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setInfoMsg(null);
+    setSubmitting(true);
+    try {
+      await api.verifyRegistrationEmail(email, verificationCode);
+      await onAuthenticated();
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'IFRAME_COOKIE_BLOCKED') {
+        setIframeCookieBlocked(true);
+      }
+      setError(err instanceof ApiError || err instanceof Error ? err.message : 'Code de vérification invalide.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleResendRegistrationCode = async () => {
+    setError(null);
+    setInfoMsg(null);
+    setSubmitting(true);
+    try {
+      await api.resendRegistrationCode(email);
+      setInfoMsg(`Un nouveau code a été envoyé à ${email.trim().toLowerCase()}.`);
+    } catch (err) {
+      setError(err instanceof ApiError || err instanceof Error ? err.message : 'Impossible de renvoyer le code.');
     } finally {
       setSubmitting(false);
     }
@@ -138,7 +176,9 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
               type="button"
               onClick={() => {
                 setMode('login');
+                setVerificationPending(false);
                 setError(null);
+                setInfoMsg(null);
               }}
               className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold transition-colors cursor-pointer ${
                 mode === 'login'
@@ -152,7 +192,9 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
               type="button"
               onClick={() => {
                 setMode('register');
+                setVerificationPending(false);
                 setError(null);
+                setInfoMsg(null);
               }}
               className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold transition-colors cursor-pointer ${
                 mode === 'register'
@@ -234,6 +276,41 @@ export function AuthView({ sso, onAuthenticated }: AuthViewProps) {
                 <KeyRound className="h-4 w-4" />
                 {submitting ? 'Vérification en cours…' : 'Se connecter'}
               </button>
+            </form>
+          ) : verificationPending ? (
+            <form onSubmit={handleVerifyRegistration} className="space-y-4">
+              <div className="rounded-lg border border-emerald-100 bg-emerald-50/60 p-4 text-sm text-stone-700">
+                Consultez la boîte de réception de <span className="font-semibold">{email}</span> et saisissez le code reçu. Vérifiez aussi les courriers indésirables.
+              </div>
+              <div>
+                <label htmlFor="verification-code" className="block text-sm font-medium text-stone-800">Code de vérification</label>
+                <input
+                  id="verification-code"
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  required
+                  value={verificationCode}
+                  onChange={(e) => setVerificationCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="000000"
+                  className="mt-1.5 w-full rounded-lg border border-stone-300 px-3.5 py-2.5 text-center font-mono text-lg tracking-[0.35em] focus:border-emerald-800 focus:outline-none focus:ring-2 focus:ring-emerald-800/15"
+                />
+                <p className="mt-1.5 text-xs text-stone-500">Le code expire après 10 minutes. Après validation, votre dossier EST Fès restera en attente de vérification par la bibliothèque.</p>
+              </div>
+              <button
+                type="submit"
+                disabled={submitting || verificationCode.length !== 6}
+                className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-60"
+              >
+                <ShieldCheck className="h-4 w-4" />
+                {submitting ? 'Vérification…' : 'Vérifier et créer mon compte'}
+              </button>
+              <div className="flex flex-wrap justify-between gap-3 text-xs">
+                <button type="button" disabled={submitting} onClick={() => void handleResendRegistrationCode()} className="font-semibold text-emerald-900 hover:underline disabled:opacity-50">Renvoyer un code</button>
+                <button type="button" onClick={() => { setVerificationPending(false); setVerificationCode(''); setError(null); setInfoMsg(null); }} className="text-stone-600 hover:underline">Modifier mes informations</button>
+              </div>
             </form>
           ) : (
             <form onSubmit={handleRegister} className="space-y-4">

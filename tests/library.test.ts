@@ -307,7 +307,7 @@ test('14. Un étudiant authentifié ne peut jamais accéder aux routes d’admin
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: 'salma.bennani@usmba.ac.ma',
+        email: 'salma.demo@usmba.example',
         password: 'EtudiantEST2026!',
       }),
     });
@@ -357,7 +357,7 @@ test('15. Authentification complète : identifiants invalides, contexte HTTPS to
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: 'salma.bennani@usmba.ac.ma',
+        email: 'salma.demo@usmba.example',
         password: 'MauvaisMotDePasse!',
       }),
     });
@@ -371,7 +371,7 @@ test('15. Authentification complète : identifiants invalides, contexte HTTPS to
         'X-Forwarded-Proto': 'https',
       },
       body: JSON.stringify({
-        email: 'salma.bennani@usmba.ac.ma',
+        email: 'salma.demo@usmba.example',
         password: 'EtudiantEST2026!',
       }),
     });
@@ -391,7 +391,7 @@ test('15. Authentification complète : identifiants invalides, contexte HTTPS to
         'X-BiblioEST-Embed': 'cross-site-iframe',
       },
       body: JSON.stringify({
-        email: 'salma.bennani@usmba.ac.ma',
+        email: 'salma.demo@usmba.example',
         password: 'EtudiantEST2026!',
       }),
     });
@@ -430,7 +430,7 @@ test('15. Authentification complète : identifiants invalides, contexte HTTPS to
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: 'bibliothecaire@est-usmba.ac.ma',
+        email: 'bibliothecaire.demo@est-usmba.example',
         password: 'BiblioAdmin2026!',
       }),
     });

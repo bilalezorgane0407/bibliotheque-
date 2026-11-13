@@ -35,6 +35,18 @@ export function initSchema(db: Database.Database): void {
       createdAt TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS pending_registrations (
+      email TEXT PRIMARY KEY,
+      fullName TEXT NOT NULL,
+      passwordHash TEXT NOT NULL,
+      cne TEXT,
+      filiere TEXT,
+      codeHash TEXT NOT NULL,
+      expiresAt TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      lastSentAt TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS books (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -106,6 +118,18 @@ export function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_reservations_book_status_req ON reservations(bookId, status, requestedAt);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, createdAt DESC);
   `);
+
+  const demoAddressMigrations = [
+    ['usr-salma', 'salma.bennani@usmba.ac.ma', 'salma.demo@usmba.example'],
+    ['usr-bilale', 'bilale.zorgane@usmba.ac.ma', 'bilale.demo@usmba.example'],
+    ['usr-youssef', 'youssef.alaoui@usmba.ac.ma', 'youssef.demo@usmba.example'],
+    ['usr-karim', 'karim.tazi@usmba.ac.ma', 'karim.demo@usmba.example'],
+    ['usr-lib', 'bibliothecaire@est-usmba.ac.ma', 'bibliothecaire.demo@est-usmba.example'],
+  ];
+  const migrateDemoAddress = db.prepare('UPDATE users SET email = ? WHERE id = ? AND LOWER(email) = ?');
+  for (const [id, oldEmail, demoEmail] of demoAddressMigrations) {
+    migrateDemoAddress.run(demoEmail, id, oldEmail);
+  }
 }
 
 export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new Date()): void {
@@ -129,7 +153,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
       {
         id: 'usr-salma',
         fullName: 'Salma Bennani',
-        email: 'salma.bennani@usmba.ac.ma',
+        email: 'salma.demo@usmba.example',
         passwordHash: studentHash,
         role: 'membre',
         institution: 'EST Fès',
@@ -143,7 +167,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
       {
         id: 'usr-bilale',
         fullName: 'Bilale Zorgane',
-        email: 'bilale.zorgane@usmba.ac.ma',
+        email: 'bilale.demo@usmba.example',
         passwordHash: studentHash,
         role: 'membre',
         institution: 'EST Fès',
@@ -157,7 +181,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
       {
         id: 'usr-youssef',
         fullName: 'Youssef El Alaoui',
-        email: 'youssef.alaoui@usmba.ac.ma',
+        email: 'youssef.demo@usmba.example',
         passwordHash: studentHash,
         role: 'membre',
         institution: 'EST Fès',
@@ -171,7 +195,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
       {
         id: 'usr-karim',
         fullName: 'Karim Tazi',
-        email: 'karim.tazi@usmba.ac.ma',
+        email: 'karim.demo@usmba.example',
         passwordHash: studentHash,
         role: 'membre',
         institution: 'EST Fès',
@@ -185,7 +209,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
       {
         id: 'usr-lib',
         fullName: 'Nadia Benjelloun',
-        email: 'bibliothecaire@est-usmba.ac.ma',
+        email: 'bibliothecaire.demo@est-usmba.example',
         passwordHash: librarianHash,
         role: 'bibliothecaire',
         institution: 'EST Fès',

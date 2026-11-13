@@ -24,6 +24,18 @@ import type {
   UserPublic,
 } from '../shared/types.ts';
 
+const emailVerificationSendLimits = new Map<string, { count: number; resetAt: number }>();
+function allowVerificationEmail(ip: string, nowMs: number): boolean {
+  const limit = emailVerificationSendLimits.get(ip);
+  if (!limit || limit.resetAt <= nowMs) {
+    emailVerificationSendLimits.set(ip, { count: 1, resetAt: nowMs + 60 * 60_000 });
+    return true;
+  }
+  if (limit.count >= 5) return false;
+  limit.count += 1;
+  return true;
+}
+
 export function createApp(db: Database.Database, getNow: () => Date = () => new Date()) {
   const app = express();
   const service = new LibraryService(db);
@@ -136,16 +148,15 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
   });
 
   app.post('/api/auth/register', (req: Request, res: Response) => {
-    const { fullName, email, password, cne, filiere, institution } = req.body as {
+    const { fullName, email, password, cne, filiere } = req.body as {
       fullName?: string;
       email?: string;
       password?: string;
       cne?: string;
       filiere?: string;
-      institution?: string;
     };
 
-    if (!fullName || !email || !password || password.length < 8) {
+    if (!fullName?.trim() || !email || !password || password.length < 8) {
       res.status(400).json({
         error:
           'Nom complet, adresse e-mail et mot de passe (8 caractères minimum) sont requis.',
@@ -154,16 +165,17 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
 
     const normalizedEmail = email.trim().toLowerCase();
-    if (!normalizedEmail.endsWith('@usmba.ac.ma') && !normalizedEmail.endsWith('@est-usmba.ac.ma')) {
+    if (
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) ||
+      (!normalizedEmail.endsWith('@usmba.ac.ma') && !normalizedEmail.endsWith('@est-usmba.ac.ma'))
+    ) {
       res.status(400).json({
         error: 'Utilisez une adresse académique institutionnelle @usmba.ac.ma ou @est-usmba.ac.ma.',
       });
       return;
     }
 
-    const existing = db
-      .prepare(`SELECT id FROM users WHERE LOWER(email) = ?`)
-      .get(normalizedEmail);
+    const existing = db.prepare(`SELECT id FROM users WHERE LOWER(email) = ?`).get(normalizedEmail);
     if (existing) {
       res.status(409).json({
         error: 'Un compte associé à cette adresse e-mail USMBA existe déjà.',
@@ -171,44 +183,191 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       return;
     }
 
-    // Règle métier : l'inscription locale ne confère JAMAIS automatiquement le statut étudiant EST Fès vérifié.
-    const userId = `usr-${crypto.randomUUID().slice(0, 12)}`;
-    const nowIso = getNow().toISOString();
-    const targetInstitution = institution?.trim() || 'EST Fès';
-    const initialStudentStatus: StudentStatus =
-      targetInstitution === 'EST Fès' ? 'en_attente' : 'non_est';
+    db.prepare(`DELETE FROM pending_registrations WHERE expiresAt <= ?`).run(getNow().toISOString());
+    const pending = db
+      .prepare(`SELECT lastSentAt FROM pending_registrations WHERE email = ?`)
+      .get(normalizedEmail) as { lastSentAt: string } | undefined;
+    const now = getNow();
+    if (pending && now.getTime() - new Date(pending.lastSentAt).getTime() < 60_000) {
+      res.status(429).json({ error: 'Un code vient d’être envoyé. Attendez une minute avant de le renvoyer.' });
+      return;
+    }
 
+    const apiKey = process.env.RESEND_API_KEY?.trim();
+    const from = process.env.EMAIL_FROM?.trim();
+    if (process.env.EMAIL_SEND_ENABLED !== 'true' || !apiKey || !from) {
+      res.status(503).json({
+        error: 'La vérification par e-mail n’est pas configurée. L’administrateur doit configurer l’envoi d’e-mails.',
+        code: 'EMAIL_SENDING_NOT_CONFIGURED',
+      });
+      return;
+    }
+    if (!allowVerificationEmail(req.ip || 'unknown', now.getTime())) {
+      res.status(429).json({ error: 'Trop de demandes d’inscription depuis cette connexion. Réessayez dans une heure.' });
+      return;
+    }
+
+    const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+    const secret = process.env.SESSION_SECRET || crypto
+      .createHash('sha256')
+      .update(process.cwd() + '_biblioest_dev_session_key')
+      .digest('hex');
+    const codeHash = crypto.createHmac('sha256', secret).update(`${normalizedEmail}:${code}`).digest('hex');
+    const expiresAt = new Date(now.getTime() + 10 * 60_000).toISOString();
+    const lastSentAt = now.toISOString();
     db.prepare(
-      `INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt)
-       VALUES (?, ?, ?, ?, 'membre', ?, ?, 'actif', ?, ?, 'local', ?)`
+      `INSERT INTO pending_registrations (email, fullName, passwordHash, cne, filiere, codeHash, expiresAt, attempts, lastSentAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(email) DO UPDATE SET fullName = excluded.fullName, passwordHash = excluded.passwordHash,
+         cne = excluded.cne, filiere = excluded.filiere, codeHash = excluded.codeHash,
+         expiresAt = excluded.expiresAt, attempts = 0, lastSentAt = excluded.lastSentAt`
     ).run(
-      userId,
-      fullName.trim(),
       normalizedEmail,
+      fullName.trim(),
       hashPassword(password),
-      targetInstitution,
-      initialStudentStatus,
       cne?.trim() || null,
       filiere?.trim() || null,
-      nowIso
+      codeHash,
+      expiresAt,
+      lastSentAt
     );
 
-    const user = db
-      .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt
-         FROM users WHERE id = ?`
-      )
-      .get(userId) as UserPublic;
+    void fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from,
+        to: [normalizedEmail],
+        subject: 'Votre code de vérification BiblioEST',
+        text: `Bonjour ${fullName.trim()},\n\nVotre code de vérification BiblioEST est : ${code}\n\nIl expire dans 10 minutes. Si vous n’avez pas demandé cette inscription, ignorez ce message.\n\nBibliothèque de l’EST Fès · USMBA`,
+      }),
+      signal: AbortSignal.timeout(10000),
+    }).then(async (providerResponse) => {
+      if (providerResponse.ok) {
+        console.info('[auth:register]', { status: 202, outcome: 'VERIFICATION_SENT' });
+        res.status(202).json({ verificationRequired: true, email: normalizedEmail });
+        return;
+      }
+      const providerError = await providerResponse.text();
+      console.error('[auth:register] email provider rejected verification email', {
+        status: providerResponse.status,
+        providerError,
+      });
+      db.prepare(`DELETE FROM pending_registrations WHERE email = ?`).run(normalizedEmail);
+      res.status(502).json({ error: 'Le fournisseur e-mail a refusé le message de vérification.', code: 'EMAIL_PROVIDER_REJECTED' });
+    }).catch((err: unknown) => {
+      db.prepare(`DELETE FROM pending_registrations WHERE email = ?`).run(normalizedEmail);
+      console.error('[auth:register] verification email failed', err);
+      if (!res.headersSent) res.status(502).json({ error: 'Impossible d’envoyer le code de vérification.', code: 'EMAIL_SEND_FAILED' });
+    });
+  });
 
+  app.post('/api/auth/register/resend', async (req: Request, res: Response) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!email) {
+      res.status(400).json({ error: 'Adresse e-mail requise.' });
+      return;
+    }
+    const pending = db.prepare(`SELECT email, fullName, lastSentAt FROM pending_registrations WHERE email = ?`)
+      .get(email) as { email: string; fullName: string; lastSentAt: string } | undefined;
+    if (!pending) {
+      res.status(404).json({ error: 'Aucune inscription en attente pour cette adresse.' });
+      return;
+    }
+    const apiKey = process.env.RESEND_API_KEY?.trim();
+    const from = process.env.EMAIL_FROM?.trim();
+    if (process.env.EMAIL_SEND_ENABLED !== 'true' || !apiKey || !from) {
+      res.status(503).json({ error: 'L’envoi d’e-mails n’est pas configuré.', code: 'EMAIL_SENDING_NOT_CONFIGURED' });
+      return;
+    }
+    const now = getNow();
+    if (!allowVerificationEmail(req.ip || 'unknown', now.getTime())) {
+      res.status(429).json({ error: 'Trop de demandes de code. Réessayez dans une heure.' });
+      return;
+    }
+    if (now.getTime() - new Date(pending.lastSentAt).getTime() < 60_000) {
+      res.status(429).json({ error: 'Attendez une minute avant de demander un nouveau code.' });
+      return;
+    }
+    const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+    const secret = process.env.SESSION_SECRET || crypto.createHash('sha256').update(process.cwd() + '_biblioest_dev_session_key').digest('hex');
+    const codeHash = crypto.createHmac('sha256', secret).update(`${email}:${code}`).digest('hex');
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from,
+          to: [email],
+          subject: 'Votre nouveau code BiblioEST',
+          text: `Bonjour ${pending.fullName},\n\nVotre nouveau code de vérification BiblioEST est : ${code}\n\nIl expire dans 10 minutes.\n\nBibliothèque de l’EST Fès · USMBA`,
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) {
+        res.status(502).json({ error: 'Le fournisseur e-mail a refusé le message de vérification.', code: 'EMAIL_PROVIDER_REJECTED' });
+        return;
+      }
+      db.prepare(`UPDATE pending_registrations SET codeHash = ?, expiresAt = ?, attempts = 0, lastSentAt = ? WHERE email = ?`)
+        .run(codeHash, new Date(now.getTime() + 10 * 60_000).toISOString(), now.toISOString(), email);
+      res.json({ sent: true });
+    } catch {
+      res.status(502).json({ error: 'Impossible d’envoyer le code de vérification.', code: 'EMAIL_SEND_FAILED' });
+    }
+  });
+
+  app.post('/api/auth/register/verify', (req: Request, res: Response) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+    if (!email || !/^\d{6}$/.test(code)) {
+      res.status(400).json({ error: 'Adresse e-mail et code à 6 chiffres requis.' });
+      return;
+    }
+    const pending = db.prepare(`SELECT * FROM pending_registrations WHERE email = ?`)
+      .get(email) as {
+        email: string; fullName: string; passwordHash: string; cne: string | null; filiere: string | null;
+        codeHash: string; expiresAt: string; attempts: number;
+      } | undefined;
+    if (!pending || new Date(pending.expiresAt).getTime() <= getNow().getTime() || pending.attempts >= 5) {
+      if (pending) db.prepare(`DELETE FROM pending_registrations WHERE email = ?`).run(email);
+      res.status(400).json({ error: 'Code invalide ou expiré. Demandez un nouveau code.' });
+      return;
+    }
+    const secret = process.env.SESSION_SECRET || crypto.createHash('sha256').update(process.cwd() + '_biblioest_dev_session_key').digest('hex');
+    const submittedHash = crypto.createHmac('sha256', secret).update(`${email}:${code}`).digest('hex');
+    const submitted = Buffer.from(submittedHash, 'hex');
+    const expected = Buffer.from(pending.codeHash, 'hex');
+    if (submitted.length !== expected.length || !crypto.timingSafeEqual(submitted, expected)) {
+      const attempts = pending.attempts + 1;
+      db.prepare(`UPDATE pending_registrations SET attempts = ? WHERE email = ?`).run(attempts, email);
+      if (attempts >= 5) db.prepare(`DELETE FROM pending_registrations WHERE email = ?`).run(email);
+      res.status(400).json({ error: attempts >= 5 ? 'Trop de codes incorrects. Recommencez l’inscription.' : 'Code incorrect.' });
+      return;
+    }
+
+    const existing = db.prepare(`SELECT id FROM users WHERE LOWER(email) = ?`).get(email);
+    if (existing) {
+      db.prepare(`DELETE FROM pending_registrations WHERE email = ?`).run(email);
+      res.status(409).json({ error: 'Un compte associé à cette adresse académique existe déjà.' });
+      return;
+    }
+    const userId = `usr-${crypto.randomUUID().slice(0, 12)}`;
+    const nowIso = getNow().toISOString();
+    const userInstitution = 'EST Fès';
+    const initialStudentStatus: StudentStatus = 'en_attente';
+    const createUser = db.transaction(() => {
+      db.prepare(
+        `INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt)
+         VALUES (?, ?, ?, ?, 'membre', ?, ?, 'actif', ?, ?, 'local', ?)`
+      ).run(userId, pending.fullName, email, pending.passwordHash, userInstitution, initialStudentStatus, pending.cne, pending.filiere, nowIso);
+      db.prepare(`DELETE FROM pending_registrations WHERE email = ?`).run(email);
+    });
+    createUser();
+    const user = db.prepare(
+      `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, createdAt FROM users WHERE id = ?`
+    ).get(userId) as UserPublic;
     setSessionCookie(req, res, user.id);
     const eligibility = service.checkEligibility(user.id, getNow());
-    console.info('[auth:register]', {
-      status: 201,
-      outcome: 'REGISTERED',
-      userId: user.id,
-      studentStatus: user.studentStatus,
-      https: isHttpsRequest(req),
-    });
     res.status(201).json({ user, eligibility });
   });
 
