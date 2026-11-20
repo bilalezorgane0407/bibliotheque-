@@ -23,6 +23,7 @@ interface CartPageProps {
   user: UserPublic | null;
   eligibility: EligibilityReport | null;
   items: CartItemRecord[];
+  borrowingDurationDays?: number;
   onRequireAuth: () => void;
   onOpenBook: (bookId: string) => void;
   onBrowseCatalogue: () => void;
@@ -35,6 +36,7 @@ export function CartPage({
   user,
   eligibility,
   items,
+  borrowingDurationDays = 7,
   onRequireAuth,
   onOpenBook,
   onBrowseCatalogue,
@@ -55,7 +57,7 @@ export function CartPage({
           Panier de demandes
         </h1>
         <p className="mt-2 text-sm text-stone-600">
-          Connectez-vous avec votre compte institutionnel fourni par l’école pour constituer et confirmer votre panier de demandes (emprunt ou réservation FIFO).
+          Connectez-vous avec votre compte institutionnel fourni par l’école pour constituer et confirmer votre panier de demandes (retenue 24 h au comptoir ou réservation FIFO).
         </p>
         <button
           type="button"
@@ -132,7 +134,11 @@ export function CartPage({
           <strong className="font-semibold text-stone-900">
             ne réserve aucun exemplaire physique
           </strong>
-          . Au moment de la confirmation, le serveur vérifie votre éligibilité, l’absence de retard et l’état réel du stock pour enregistrer soit un emprunt (7 jours), soit une réservation FIFO, soit un refus motivé.
+          . Au clic sur « Confirmer mes demandes », le serveur vérifie votre éligibilité, puis affecte pour chaque titre disponible sans file prioritaire une{' '}
+          <strong className="font-semibold text-stone-900">retenue de 24 h au comptoir</strong>{' '}
+          (le prêt de {borrowingDurationDays} jours ne démarre qu’au retrait par scan), ou crée une{' '}
+          <strong className="font-semibold text-stone-900">réservation FIFO</strong>{' '}
+          si un retour physique est attendu.
         </p>
       </div>
 
@@ -167,17 +173,17 @@ export function CartPage({
             <div className="flex flex-wrap items-center gap-4 text-xs font-semibold">
               <button
                 type="button"
-                onClick={onGoToLoans}
-                className="min-h-[36px] text-emerald-900 hover:underline cursor-pointer"
-              >
-                Voir Mes emprunts
-              </button>
-              <button
-                type="button"
                 onClick={onGoToReservations}
                 className="min-h-[36px] text-emerald-900 hover:underline cursor-pointer"
               >
-                Voir Mes réservations
+                Voir Mes réservations & retenues
+              </button>
+              <button
+                type="button"
+                onClick={onGoToLoans}
+                className="min-h-[36px] text-stone-700 hover:underline cursor-pointer"
+              >
+                Voir Mes emprunts
               </button>
             </div>
           </div>
@@ -185,7 +191,7 @@ export function CartPage({
           <div className="divide-y divide-stone-100">
             {results.map((r) => (
               <div key={`${r.bookId}-${r.outcome}`} className="py-3 flex items-start gap-3">
-                {r.outcome === 'emprunt_enregistre' ? (
+                {r.outcome === 'retenue_24h_creee' ? (
                   <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-800" />
                 ) : r.outcome === 'reservation_enregistree' ? (
                   <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
@@ -197,11 +203,11 @@ export function CartPage({
                     <span>{r.bookTitle}</span>
                     <span className="text-xs font-mono text-stone-500">
                       ·{' '}
-                      {r.outcome === 'emprunt_enregistre'
-                        ? 'Emprunt enregistré'
+                      {r.outcome === 'retenue_24h_creee'
+                        ? 'Retenue 24 h (à retirer au comptoir)'
                         : r.outcome === 'reservation_enregistree'
                           ? 'Réservation FIFO enregistrée'
-                          : 'Demande refusée'}
+                          : 'Ligne refusée'}
                     </span>
                   </div>
                   <p className="mt-0.5 text-xs text-stone-700">{r.message}</p>
@@ -220,7 +226,7 @@ export function CartPage({
             Votre panier de demandes est vide
           </h2>
           <p className="mt-1 text-sm text-stone-600">
-            Parcourez le catalogue pour sélectionner les ouvrages à emprunter ou à réserver.
+            Parcourez le catalogue pour sélectionner les ouvrages à demander (retenue 24 h ou file FIFO).
           </p>
           <button
             type="button"
@@ -269,20 +275,41 @@ export function CartPage({
                       </h2>
                       <p className="text-xs text-stone-600">{item.book.authors}</p>
 
-                      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs tabular-nums">
+                      <div className="mt-2 space-y-1 text-xs tabular-nums">
                         {available ? (
-                          <span className="font-semibold text-emerald-800">
+                          <div className="font-semibold text-emerald-800">
                             Stock indicatif : {item.book.availableCopies} disponible(s)
-                          </span>
+                          </div>
                         ) : circulating ? (
-                          <span className="font-semibold text-amber-800">
+                          <div className="font-semibold text-amber-800">
                             Stock indicatif : aucun exemplaire libre (file FIFO ouverte)
-                          </span>
+                          </div>
                         ) : (
-                          <span className="font-semibold text-red-700">
+                          <div className="font-semibold text-red-700">
                             Hors circulation : aucun exemplaire actif
-                          </span>
+                          </div>
                         )}
+
+                        <div className="text-stone-700">
+                          <span className="font-semibold text-stone-900">Traitement prévu : </span>
+                          {eligibility && !eligibility.eligible ? (
+                            <span className="text-red-700">
+                              Refus global — {eligibility.reasonMessage}
+                            </span>
+                          ) : available ? (
+                            <span className="text-emerald-900 font-medium">
+                              Retenue 24 h au comptoir (si aucune file FIFO prioritaire)
+                            </span>
+                          ) : circulating ? (
+                            <span className="text-amber-900 font-medium">
+                              Réservation en file FIFO (aucune date promise)
+                            </span>
+                          ) : (
+                            <span className="text-red-700 font-medium">
+                              Refus prévisible — aucun exemplaire physique susceptible de revenir
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -335,7 +362,7 @@ export function CartPage({
             <div className="flex items-start gap-2.5 rounded-lg border border-stone-200 bg-white p-3.5 text-xs text-stone-700">
               <Info className="mt-0.5 h-4 w-4 shrink-0 text-emerald-900" />
               <span className="leading-relaxed">
-                La disponibilité réelle n’est verrouillée qu’au clic sur « Confirmer mes demandes ». Si un autre lecteur a emprunté le dernier exemplaire entre-temps, votre demande basculera automatiquement en réservation FIFO ou indiquera la raison exacte du refus.
+                Au clic sur « Confirmer mes demandes », le serveur vérifie d’abord votre éligibilité, puis traite chaque ligne : retenue 24 h pour retrait au comptoir (scan carte membre + exemplaire), réservation FIFO, ou refus motivé conservant les autres lignes acceptées.
               </span>
             </div>
 

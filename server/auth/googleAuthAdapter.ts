@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type Database from 'better-sqlite3';
 import type { GoogleAuthStatus, StudentStatus, UserPublic, UserRole } from '../../shared/types.ts';
 
@@ -8,6 +10,7 @@ export interface GoogleOidcConfig {
   redirectUri: string;
   allowedDomain: string | null;
   librarianEmails: Set<string>;
+  adminEmails: Set<string>;
   eligibilitySourceUrl: string | null;
   eligibilityEmails: Set<string>;
   requirePreprovisioned: boolean;
@@ -37,17 +40,68 @@ function parseEmailList(raw: string | undefined): Set<string> {
   );
 }
 
+export function isAcademicGoogleEmail(
+  email: string,
+  allowedDomain?: string | null,
+  hd?: string | null
+): boolean {
+  const normalizedEmail = email.trim().toLowerCase();
+  const domain = normalizedEmail.split('@')[1] || '';
+  const hostedDomain = (hd || '').trim().toLowerCase();
+
+  if (allowedDomain) {
+    const allowed = allowedDomain.trim().toLowerCase();
+    return domain === allowed || hostedDomain === allowed;
+  }
+
+  if (domain === 'usmba.ac.ma' || domain === 'est-usmba.ac.ma') {
+    return true;
+  }
+  if (domain.endsWith('.ac.ma') || domain.endsWith('.edu.ma') || domain.endsWith('.edu')) {
+    return true;
+  }
+  if (
+    hostedDomain === 'usmba.ac.ma' ||
+    hostedDomain === 'est-usmba.ac.ma' ||
+    hostedDomain.endsWith('.ac.ma') ||
+    hostedDomain.endsWith('.edu.ma')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function readFirebaseConfigApiKey(): string | null {
+  try {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (!fs.existsSync(configPath)) return null;
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      apiKey?: string;
+      projectId?: string;
+    };
+    if (raw.apiKey && raw.projectId) {
+      return raw.apiKey.trim();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Adaptateur d'authentification Google institutionnelle (OAuth 2.0 / OpenID Connect).
- * - Ne simule jamais une authentification Google.
- * - N'expose jamais clientSecret côté client.
- * - Distingue strictement l'identité Google vérifiée de l'appartenance vérifiée à l'EST Fès.
+ * Adaptateur d'authentification Google institutionnelle (OAuth 2.0 / OpenID Connect / Firebase Auth).
+ * Distingue strictement :
+ * 1) la vérification de l'adresse e-mail académique par Google, et
+ * 2) la validation du statut d'appartenance à l'EST Fès (effectuée par le personnel autorisé ou une source officielle).
  */
 export class GoogleAuthAdapter {
   private readonly env: NodeJS.ProcessEnv;
+  private readonly fetchFn: typeof fetch;
 
-  constructor(env: NodeJS.ProcessEnv = process.env) {
+  constructor(env: NodeJS.ProcessEnv = process.env, fetchFn: typeof fetch = fetch) {
     this.env = env;
+    this.fetchFn = fetchFn;
   }
 
   public getConfig(): GoogleOidcConfig {
@@ -77,6 +131,7 @@ export class GoogleAuthAdapter {
       redirectUri,
       allowedDomain: allowedDomainRaw || null,
       librarianEmails: parseEmailList(this.env.LIBRARIAN_EMAILS),
+      adminEmails: parseEmailList(this.env.ADMIN_EMAILS),
       eligibilitySourceUrl: (this.env.EST_ELIGIBILITY_SOURCE_URL || '').trim() || null,
       eligibilityEmails: parseEmailList(this.env.EST_ELIGIBILITY_EMAILS),
       requirePreprovisioned: this.env.GOOGLE_REQUIRE_PREPROVISIONED === 'true',
@@ -86,6 +141,14 @@ export class GoogleAuthAdapter {
   public isConfigured(): boolean {
     const cfg = this.getConfig();
     return Boolean(cfg.clientId && cfg.clientSecret && cfg.redirectUri);
+  }
+
+  public getFirebaseApiKey(): string | null {
+    return (this.env.FIREBASE_WEB_API_KEY || '').trim() || readFirebaseConfigApiKey();
+  }
+
+  public isFirebaseConfigured(): boolean {
+    return Boolean(this.getFirebaseApiKey());
   }
 
   public isEligibilitySourceConfigured(): boolean {
@@ -100,6 +163,7 @@ export class GoogleAuthAdapter {
     if (!cfg.clientSecret) missingVariables.push('GOOGLE_CLIENT_SECRET');
 
     const configured = missingVariables.length === 0;
+    const firebaseAuthConfigured = this.isFirebaseConfigured();
     const sharedUrl = (this.env.SHARED_APP_URL || '').trim();
     const sharedRedirectUri = sharedUrl
       ? `${sharedUrl.replace(/\/$/, '')}/api/auth/google/callback`
@@ -108,6 +172,7 @@ export class GoogleAuthAdapter {
     return {
       provider: 'Google Workspace Éducation / USMBA (OAuth 2.0 / OIDC)',
       configured,
+      firebaseAuthConfigured,
       clientIdConfigured: Boolean(cfg.clientId),
       redirectUri: cfg.redirectUri,
       sharedRedirectUri,
@@ -115,11 +180,10 @@ export class GoogleAuthAdapter {
       eligibilitySourceConfigured: this.isEligibilitySourceConfigured(),
       missingVariables,
       recoveryUrl: 'https://accounts.google.com/signin/recovery',
-      message: configured
-        ? this.isEligibilitySourceConfigured()
-          ? 'Authentification Google et source d’éligibilité EST Fès configurées.'
-          : 'Authentification Google configurée, mais aucune source externe d’éligibilité EST Fès n’est connectée : les nouveaux comptes nécessiteront une validation par un bibliothécaire.'
-        : 'Les identifiants Google OAuth ne sont pas encore configurés dans cet environnement. Renseignez GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET côté serveur pour activer la connexion Google officielle.',
+      message:
+        configured || firebaseAuthConfigured
+          ? 'Connexion avec adresse académique active. La vérification de l’adresse confirme la boîte universitaire ; l’accès aux emprunts nécessite la validation du statut EST Fès par le personnel autorisé.'
+          : 'Les identifiants Google OAuth ne sont pas encore configurés dans cet environnement. Renseignez GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET côté serveur pour activer la connexion Google officielle.',
     };
   }
 
@@ -155,7 +219,7 @@ export class GoogleAuthAdapter {
       throw new Error('Identifiants Google OAuth manquants côté serveur.');
     }
 
-    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    const tokenRes = await this.fetchFn('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -176,7 +240,7 @@ export class GoogleAuthAdapter {
       throw new Error('Jeton d’accès Google absent de la réponse OAuth.');
     }
 
-    const userInfoRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+    const userInfoRes = await this.fetchFn('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
@@ -187,6 +251,74 @@ export class GoogleAuthAdapter {
     const claims = (await userInfoRes.json()) as GoogleUserInfoClaims;
     if (!claims.email || !claims.email_verified) {
       throw new Error('Le compte Google retourné ne possède pas d’adresse e-mail vérifiée.');
+    }
+
+    return claims;
+  }
+
+  public async verifyFirebaseOrGoogleToken(params: {
+    idToken?: string;
+    accessToken?: string | null;
+  }): Promise<GoogleUserInfoClaims> {
+    const { idToken, accessToken } = params;
+    let claims: GoogleUserInfoClaims | null = null;
+
+    if (accessToken) {
+      const userInfoRes = await this.fetchFn('https://openidconnect.googleapis.com/v1/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (userInfoRes.ok) {
+        const data = (await userInfoRes.json()) as Partial<GoogleUserInfoClaims>;
+        if (data.email && data.email_verified) {
+          claims = {
+            sub: data.sub || data.email,
+            email: data.email,
+            email_verified: Boolean(data.email_verified),
+            name: data.name,
+            hd: data.hd,
+          };
+        }
+      }
+    }
+
+    if (!claims && idToken) {
+      const apiKey = this.getFirebaseApiKey();
+      if (!apiKey) {
+        throw new Error('Vérification Firebase non configurée côté serveur.');
+      }
+      const lookupRes = await this.fetchFn(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (!lookupRes.ok) {
+        throw new Error('Jeton Google / Firebase invalide ou expiré.');
+      }
+      const lookupData = (await lookupRes.json()) as {
+        users?: Array<{
+          localId?: string;
+          email?: string;
+          emailVerified?: boolean;
+          displayName?: string;
+        }>;
+      };
+      const fbUser = lookupData.users?.[0];
+      if (!fbUser?.email || !fbUser.emailVerified) {
+        throw new Error('Le compte Google retourné ne possède pas d’adresse e-mail vérifiée.');
+      }
+      claims = {
+        sub: fbUser.localId || fbUser.email,
+        email: fbUser.email,
+        email_verified: true,
+        name: fbUser.displayName,
+      };
+    }
+
+    if (!claims) {
+      throw new Error('Impossible de vérifier votre compte Google auprès des serveurs Google.');
     }
 
     return claims;
@@ -205,7 +337,7 @@ export class GoogleAuthAdapter {
     try {
       const url = new URL(cfg.eligibilitySourceUrl);
       url.searchParams.set('email', email.toLowerCase());
-      const res = await fetch(url.toString(), { method: 'GET' });
+      const res = await this.fetchFn(url.toString(), { method: 'GET' });
       if (!res.ok) return null;
       const data = (await res.json()) as { eligible?: boolean; institution?: string };
       if (typeof data.eligible === 'boolean') {
@@ -220,7 +352,8 @@ export class GoogleAuthAdapter {
   public async resolveProvisionedUser(
     db: Database.Database,
     claims: GoogleUserInfoClaims,
-    now: Date = new Date()
+    now: Date = new Date(),
+    options?: { requireAcademicEmail?: boolean }
   ): Promise<GoogleAuthResolution> {
     const cfg = this.getConfig();
     const email = claims.email.trim().toLowerCase();
@@ -233,11 +366,26 @@ export class GoogleAuthAdapter {
           `Seuls les comptes Google administrés par le domaine ${cfg.allowedDomain} sont acceptés.`
         );
       }
+    } else if (
+      options?.requireAcademicEmail &&
+      this.env.ALLOW_ALL_GOOGLE_ACCOUNTS !== 'true' &&
+      !isAcademicGoogleEmail(email, cfg.allowedDomain, claims.hd)
+    ) {
+      throw new Error(
+        'Seules les adresses Gmail académiques (ex. @usmba.ac.ma, @est-usmba.ac.ma ou domaine universitaire .ac.ma) sont autorisées.'
+      );
     }
 
     const existing = db
       .prepare(`SELECT * FROM users WHERE LOWER(email) = LOWER(?)`)
-      .get(email) as (UserPublic & { passwordHash: string; isDemo?: number }) | undefined;
+      .get(email) as
+      | (UserPublic & {
+          passwordHash: string;
+          isDemo?: number;
+          emailVerified?: number;
+          isAdmin?: number;
+        })
+      | undefined;
 
     if (!existing && cfg.requirePreprovisioned) {
       throw new Error(
@@ -246,76 +394,111 @@ export class GoogleAuthAdapter {
     }
 
     const externalCheck = await this.checkExternalEstEligibility(email);
-    const isProvisionedLibrarian = cfg.librarianEmails.has(email);
+    const isAdminEmail = cfg.adminEmails.has(email);
+    const isProvisionedLibrarian = cfg.librarianEmails.has(email) || isAdminEmail;
 
     if (existing) {
-      // Ne jamais rétrograder ni auto-promouvoir par une saisie utilisateur :
-      // le rôle bibliothécaire provient uniquement de la config serveur sécurisée ou de la base admin.
       const nextRole: UserRole =
         isProvisionedLibrarian || existing.role === 'bibliothecaire'
           ? 'bibliothecaire'
           : 'membre';
+      const nextIsAdmin = isAdminEmail || Boolean(existing.isAdmin) ? 1 : 0;
 
+      // Préserver le statut EST existant (ou le passer à 'verifie' si confirmé par la source officielle / personnel)
       let nextStudentStatus: StudentStatus = existing.studentStatus;
-      let eligibilityVerifiedBySource = existing.studentStatus === 'verifie';
-      if (externalCheck === true) {
+      if (existing.studentStatus !== 'suspendu' && (externalCheck === true || isProvisionedLibrarian)) {
         nextStudentStatus = 'verifie';
-        eligibilityVerifiedBySource = true;
       }
+
+      const eligibilityVerifiedBySource =
+        externalCheck === true || nextStudentStatus === 'verifie';
 
       db.prepare(
         `UPDATE users
-         SET fullName = ?, role = ?, studentStatus = ?, authSource = 'google_oidc', isDemo = 0
+         SET fullName = ?, role = ?, studentStatus = ?, emailVerified = 1, isAdmin = ?, authSource = 'google_oidc', isDemo = 0
          WHERE id = ?`
-      ).run(claims.name?.trim() || existing.fullName, nextRole, nextStudentStatus, existing.id);
+      ).run(
+        claims.name?.trim() || existing.fullName,
+        nextRole,
+        nextStudentStatus,
+        nextIsAdmin,
+        existing.id
+      );
 
       const updated = db
         .prepare(
-          `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
+          `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
            FROM users WHERE id = ?`
         )
-        .get(existing.id) as UserPublic & { isDemo?: number };
+        .get(existing.id) as UserPublic & {
+        isDemo?: number;
+        emailVerified?: number;
+        isAdmin?: number;
+      };
 
       return {
-        user: { ...updated, isDemo: Boolean(updated.isDemo) },
+        user: {
+          ...updated,
+          emailVerified: Boolean(updated.emailVerified),
+          isAdmin: Boolean(updated.isAdmin),
+          isDemo: Boolean(updated.isDemo),
+        },
         eligibilityVerifiedBySource,
-        requiresLibrarianValidation:
-          updated.role === 'membre' && updated.studentStatus !== 'verifie',
+        requiresLibrarianValidation: nextStudentStatus !== 'verifie',
       };
     }
 
-    // Nouvel utilisateur vérifié par Google : un domaine seul ne prouve PAS l'appartenance à l'EST Fès
+    // Nouvel utilisateur : l'adresse académique est vérifiée par Google,
+    // mais le statut EST Fès reste en attente sauf validation par la source officielle ou liste du personnel.
     const role: UserRole = isProvisionedLibrarian ? 'bibliothecaire' : 'membre';
+    const isAdmin = isAdminEmail ? 1 : 0;
     const eligibilityVerifiedBySource = externalCheck === true || isProvisionedLibrarian;
     const studentStatus: StudentStatus = eligibilityVerifiedBySource ? 'verifie' : 'en_attente';
+    const domain = email.split('@')[1] || '';
+    const institution =
+      domain === 'est-usmba.ac.ma'
+        ? 'EST Fès'
+        : domain === 'usmba.ac.ma'
+          ? 'USMBA'
+          : claims.hd || domain || 'USMBA';
     const userId = `usr-${crypto.randomUUID().slice(0, 12)}`;
     const unguessablePlaceholderHash = `google_oidc:${crypto.randomBytes(32).toString('hex')}`;
 
     db.prepare(
-      `INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt)
-       VALUES (?, ?, ?, ?, ?, 'EST Fès', ?, 'actif', NULL, NULL, 'google_oidc', 0, ?)`
+      `INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'actif', 1, ?, NULL, NULL, 'google_oidc', 0, ?)`
     ).run(
       userId,
       claims.name?.trim() || email.split('@')[0],
       email,
       unguessablePlaceholderHash,
       role,
+      institution,
       studentStatus,
+      isAdmin,
       now.toISOString()
     );
 
     const created = db
       .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
          FROM users WHERE id = ?`
       )
-      .get(userId) as UserPublic & { isDemo?: number };
+      .get(userId) as UserPublic & {
+      isDemo?: number;
+      emailVerified?: number;
+      isAdmin?: number;
+    };
 
     return {
-      user: { ...created, isDemo: Boolean(created.isDemo) },
+      user: {
+        ...created,
+        emailVerified: Boolean(created.emailVerified),
+        isAdmin: Boolean(created.isAdmin),
+        isDemo: Boolean(created.isDemo),
+      },
       eligibilityVerifiedBySource,
-      requiresLibrarianValidation:
-        created.role === 'membre' && created.studentStatus !== 'verifie',
+      requiresLibrarianValidation: studentStatus !== 'verifie',
     };
   }
 }

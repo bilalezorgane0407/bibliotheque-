@@ -46,7 +46,7 @@ export function Navbar({
         { id: 'catalogue', label: 'Catalogue' },
         { id: 'cart', label: cartCount > 0 ? `Panier (${cartCount})` : 'Panier' },
         { id: 'loans', label: 'Mes emprunts' },
-        { id: 'reservations', label: 'Mes réservations' },
+        { id: 'reservations', label: 'Mes demandes' },
         { id: 'profile', label: 'Mon profil' },
       ];
 

@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowLeft,
   BookmarkCheck,
-  BookOpenCheck,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -29,21 +28,20 @@ interface BookDetailPageProps {
   inCart?: boolean;
   onBack: () => void;
   onRequireAuth: () => void;
-  onOperationComplete: () => Promise<void>;
   onAddToCart?: (bookId: string) => Promise<void>;
   onGoToCart?: () => void;
-  onGoToReservations: () => void;
-  onGoToLoans: () => void;
 }
 
 function getCopyStatusDisplay(status: CopyStatus) {
   switch (status) {
     case 'Disponible':
       return { icon: CheckCircle2, color: 'text-emerald-800', label: 'Disponible en rayon' };
+    case 'Retenu 24h':
+      return { icon: Clock, color: 'text-sky-800', label: 'Retenu 24 h (comptoir)' };
     case 'Emprunté':
       return { icon: Clock, color: 'text-amber-800', label: 'Emprunté' };
     case 'Réservé':
-      return { icon: BookmarkCheck, color: 'text-emerald-900', label: 'Réservé (attente retrait)' };
+      return { icon: BookmarkCheck, color: 'text-emerald-900', label: 'Réservé FIFO (retrait 3 j)' };
     case 'En réparation':
       return { icon: Wrench, color: 'text-stone-700', label: 'En réparation' };
     case 'Retiré définitivement':
@@ -58,16 +56,12 @@ export function BookDetailPage({
   inCart = false,
   onBack,
   onRequireAuth,
-  onOperationComplete,
   onAddToCart,
   onGoToCart,
-  onGoToReservations,
-  onGoToLoans,
 }: BookDetailPageProps) {
   const [book, setBook] = useState<BookDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [actionBusy, setActionBusy] = useState(false);
   const [cartBusy, setCartBusy] = useState(false);
   const [showSecondaryDetails, setShowSecondaryDetails] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 768 : false
@@ -75,7 +69,7 @@ export function BookDetailPage({
   const [feedback, setFeedback] = useState<{
     kind: 'success' | 'error';
     message: string;
-    followUp?: 'loans' | 'reservations' | 'cart';
+    followUp?: 'cart';
   } | null>(null);
 
   const loadBook = async () => {
@@ -99,63 +93,7 @@ export function BookDetailPage({
     void loadBook();
     setFeedback(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bookId]);
-
-  const handleBorrow = async () => {
-    if (!user) {
-      onRequireAuth();
-      return;
-    }
-    setActionBusy(true);
-    setFeedback(null);
-    try {
-      const res = await api.borrowBook(bookId);
-      setFeedback({
-        kind: 'success',
-        message: `Emprunt confirmé pour l’exemplaire ${res.loan.copyBarcode}. À restituer sous 7 jours.`,
-        followUp: 'loans',
-      });
-      await Promise.all([loadBook(), onOperationComplete()]);
-    } catch (err) {
-      setFeedback({
-        kind: 'error',
-        message:
-          err instanceof ApiError
-            ? err.message
-            : 'L’opération d’emprunt a été refusée par le serveur.',
-      });
-    } finally {
-      setActionBusy(false);
-    }
-  };
-
-  const handleReserve = async () => {
-    if (!user) {
-      onRequireAuth();
-      return;
-    }
-    setActionBusy(true);
-    setFeedback(null);
-    try {
-      const res = await api.reserveBook(bookId);
-      setFeedback({
-        kind: 'success',
-        message: res.message,
-        followUp: 'reservations',
-      });
-      await Promise.all([loadBook(), onOperationComplete()]);
-    } catch (err) {
-      setFeedback({
-        kind: 'error',
-        message:
-          err instanceof ApiError
-            ? err.message
-            : 'La réservation a été refusée par le serveur.',
-      });
-    } finally {
-      setActionBusy(false);
-    }
-  };
+  }, [bookId, user?.role]);
 
   const handleAddToCart = async () => {
     if (!onAddToCart) return;
@@ -170,7 +108,7 @@ export function BookDetailPage({
       setFeedback({
         kind: 'success',
         message:
-          'Ouvrage ajouté à votre panier de demandes (aucun exemplaire n’est réservé avant confirmation).',
+          'Ouvrage ajouté à votre panier. Aucun exemplaire physique n’est bloqué tant que vous n’avez pas cliqué sur « Confirmer mes demandes ».',
         followUp: 'cart',
       });
     } catch (err) {
@@ -226,7 +164,10 @@ export function BookDetailPage({
     );
   }
 
-  const isAvailable = book.availableCopies > 0;
+  const isLibrarian = user?.role === 'bibliothecaire';
+  const hasFreeCopyWithoutQueue =
+    !book.archived && book.availableCopies > 0 && book.pendingReservationsCount === 0;
+  const canRequestViaCart = !book.archived && book.circulatingCopies > 0;
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
@@ -239,9 +180,8 @@ export function BookDetailPage({
         Retour au catalogue
       </button>
 
-      {/* En-tête principal : couverture + titre + disponibilité + action principale d'abord */}
+      {/* En-tête principal : couverture + titre + disponibilité + action unique « Ajouter au panier » */}
       <div className="mt-4 grid gap-6 md:grid-cols-12 items-start">
-        {/* Couverture grand format sur tablette/desktop */}
         <div className="hidden md:block md:col-span-4">
           <div className="overflow-hidden rounded-xl border border-stone-200 bg-stone-50 aspect-[3/4]">
             <BookCover
@@ -255,7 +195,6 @@ export function BookDetailPage({
         </div>
 
         <div className="md:col-span-8 space-y-6">
-          {/* Bloc titre + couverture compacte sur mobile */}
           <div className="flex gap-4 items-start">
             <div className="md:hidden w-24 shrink-0 aspect-[3/4] overflow-hidden rounded-lg border border-stone-200 bg-stone-50">
               <BookCover
@@ -283,36 +222,36 @@ export function BookDetailPage({
                 {book.authors}
               </p>
 
-              {/* Disponibilité immédiate et synthétique */}
+              {/* Disponibilité synthétique par ouvrage (aucun code-barres exposé au public) */}
               <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm tabular-nums">
-                {isAvailable ? (
+                {hasFreeCopyWithoutQueue ? (
                   <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-800">
                     <CheckCircle2 className="h-4 w-4 shrink-0" />
-                    {book.availableCopies} exemplaire{book.availableCopies > 1 ? 's' : ''} disponible{book.availableCopies > 1 ? 's' : ''} sur {book.totalCopies}
+                    {book.availableCopies} exemplaire{book.availableCopies > 1 ? 's' : ''} disponible{book.availableCopies > 1 ? 's' : ''} sur {book.totalCopies} (retenue 24 h au comptoir)
                   </span>
-                ) : book.canReserve ? (
+                ) : canRequestViaCart ? (
                   <span className="inline-flex items-center gap-1.5 font-semibold text-amber-800">
                     <Clock className="h-4 w-4 shrink-0" />
-                    Aucun disponible ({book.borrowedCopies} emprunté{book.borrowedCopies > 1 ? 's' : ''}) · File FIFO : {book.pendingReservationsCount}
+                    Aucun disponible ({book.borrowedCopies} emprunté{book.borrowedCopies > 1 ? 's' : ''}, {book.held24hCopies ?? 0} retenu{(book.held24hCopies ?? 0) > 1 ? 's' : ''} 24 h) · File FIFO : {book.pendingReservationsCount}
                   </span>
                 ) : (
                   <span className="inline-flex items-center gap-1.5 font-semibold text-red-800">
                     <XCircle className="h-4 w-4 shrink-0" />
-                    Indisponible à l’emprunt et à la réservation
+                    Indisponible à la demande et à la réservation
                   </span>
                 )}
               </div>
             </div>
           </div>
 
-          {/* Action principale placée immédiatement au premier plan */}
+          {/* Action principale unique : Ajouter au panier */}
           <div className="rounded-xl border border-stone-200 bg-white p-4 sm:p-5 space-y-4">
             {!user ? (
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-start gap-2.5 text-sm text-stone-700">
                   <Info className="mt-0.5 h-4 w-4 shrink-0 text-emerald-900" />
                   <span>
-                    Authentification requise avec votre compte USMBA pour emprunter ou réserver cet ouvrage.
+                    Authentification requise avec votre compte USMBA pour ajouter cet ouvrage à votre panier de demandes.
                   </span>
                 </div>
                 <button
@@ -327,7 +266,7 @@ export function BookDetailPage({
               <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-sm text-amber-950">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
                 <div>
-                  <p className="font-semibold">Opération restreinte</p>
+                  <p className="font-semibold">Compte actuellement non éligible</p>
                   <p className="mt-0.5 text-xs">{eligibility.reasonMessage}</p>
                 </div>
               </div>
@@ -343,24 +282,6 @@ export function BookDetailPage({
                 }`}
               >
                 <p>{feedback.message}</p>
-                {feedback.followUp === 'loans' && (
-                  <button
-                    type="button"
-                    onClick={onGoToLoans}
-                    className="mt-2 min-h-[36px] text-xs font-semibold text-emerald-900 underline cursor-pointer"
-                  >
-                    Consulter Mes emprunts
-                  </button>
-                )}
-                {feedback.followUp === 'reservations' && (
-                  <button
-                    type="button"
-                    onClick={onGoToReservations}
-                    className="mt-2 min-h-[36px] text-xs font-semibold text-emerald-900 underline cursor-pointer"
-                  >
-                    Consulter Mes réservations
-                  </button>
-                )}
                 {feedback.followUp === 'cart' && onGoToCart && (
                   <button
                     type="button"
@@ -374,69 +295,50 @@ export function BookDetailPage({
             )}
 
             <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-3">
-              {book.canBorrow && (
-                <button
-                  type="button"
-                  disabled={actionBusy || Boolean(user && eligibility && !eligibility.eligible)}
-                  onClick={() => void handleBorrow()}
-                  className="inline-flex w-full sm:w-auto min-h-[44px] items-center justify-center gap-2 rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                >
-                  <BookOpenCheck className="h-4 w-4 shrink-0" />
-                  {actionBusy ? 'Enregistrement…' : 'Emprunter cet ouvrage (7 jours)'}
-                </button>
-              )}
-
-              {book.canReserve && (
-                <button
-                  type="button"
-                  disabled={actionBusy || Boolean(user && eligibility && !eligibility.eligible)}
-                  onClick={() => void handleReserve()}
-                  className="inline-flex w-full sm:w-auto min-h-[44px] items-center justify-center gap-2 rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                >
-                  <Clock className="h-4 w-4 shrink-0" />
-                  {actionBusy ? 'Enregistrement…' : 'Réserver (file d’attente FIFO)'}
-                </button>
-              )}
-
-              {onAddToCart && (book.canBorrow || book.canReserve) && (
-                inCart && onGoToCart ? (
-                  <button
-                    type="button"
-                    onClick={onGoToCart}
-                    className="inline-flex w-full sm:w-auto min-h-[44px] items-center justify-center gap-2 rounded-lg border border-emerald-800 bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-100 cursor-pointer"
-                  >
-                    <ShoppingBag className="h-4 w-4 shrink-0" />
-                    Dans le panier · Ouvrir
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={cartBusy}
-                    onClick={() => void handleAddToCart()}
-                    className="inline-flex w-full sm:w-auto min-h-[44px] items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-2.5 text-sm font-semibold text-stone-800 hover:border-emerald-800 hover:text-emerald-950 disabled:opacity-50 cursor-pointer"
-                  >
-                    <ShoppingBag className="h-4 w-4 shrink-0" />
-                    {cartBusy ? 'Ajout…' : 'Ajouter au panier'}
-                  </button>
-                )
-              )}
-
-              {!book.canBorrow && !book.canReserve && (
+              {isLibrarian ? (
+                <div className="flex items-start gap-2.5 text-xs text-stone-700">
+                  <Info className="mt-0.5 h-4 w-4 shrink-0 text-emerald-900" />
+                  <span>
+                    Session personnel : les retraits physiques des membres se valident au comptoir (Administration → Comptoir / Circulation) par scan de la carte membre et du code-barres de l’exemplaire.
+                  </span>
+                </div>
+              ) : !canRequestViaCart ? (
                 <p className="text-sm font-medium text-red-800">
                   {book.reservationBlockedReason ||
-                    'Cet ouvrage ne peut ni être emprunté ni être réservé.'}
+                    'Cet ouvrage ne possède aucun exemplaire en circulation susceptible de revenir.'}
                 </p>
+              ) : inCart && onGoToCart ? (
+                <button
+                  type="button"
+                  onClick={onGoToCart}
+                  className="inline-flex w-full sm:w-auto min-h-[44px] items-center justify-center gap-2 rounded-lg border border-emerald-800 bg-emerald-50 px-5 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-100 cursor-pointer"
+                >
+                  <ShoppingBag className="h-4 w-4 shrink-0" />
+                  Dans le panier · Ouvrir
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={cartBusy}
+                  onClick={() => void handleAddToCart()}
+                  className="inline-flex w-full sm:w-auto min-h-[44px] items-center justify-center gap-2 rounded-lg bg-emerald-900 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-800 disabled:opacity-50 cursor-pointer"
+                >
+                  <ShoppingBag className="h-4 w-4 shrink-0" />
+                  {cartBusy ? 'Ajout en cours…' : 'Ajouter au panier'}
+                </button>
               )}
             </div>
 
-            {book.canReserve && (
+            {canRequestViaCart && !isLibrarian && (
               <p className="text-xs text-stone-500 leading-relaxed">
-                File d’attente chronologique FIFO : aucune date de disponibilité n’est garantie. Délai de retrait de 3 jours après attribution.
+                {hasFreeCopyWithoutQueue
+                  ? 'Lors de la confirmation du panier, le serveur revalide votre éligibilité et vous affecte un exemplaire au comptoir pendant 24 h (le prêt de 7 jours démarre uniquement au retrait après scan).'
+                  : 'Aucun exemplaire libre actuellement : lors de la confirmation du panier, votre demande rejoindra la file chronologique FIFO (aucune date de disponibilité n’est promise ; délai de retrait de 3 jours après attribution).'}
               </p>
             )}
           </div>
 
-          {/* Informations secondaires repliables (résumé long + détails bibliographiques + compteurs) */}
+          {/* Informations secondaires repliables */}
           <div className="rounded-xl border border-stone-200 bg-stone-50/40 p-4 sm:p-5">
             {!showSecondaryDetails && book.description && (
               <p className="text-sm leading-relaxed text-stone-700 line-clamp-2 mb-3">
@@ -496,7 +398,7 @@ export function BookDetailPage({
                   </div>
                 </dl>
 
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
                   <div className="rounded-lg border border-stone-200 bg-white p-3">
                     <div className="font-mono text-lg font-semibold text-emerald-900 tabular-nums">
                       {book.availableCopies}
@@ -504,6 +406,12 @@ export function BookDetailPage({
                     <div className="text-xs text-stone-600">
                       Disponible{book.availableCopies > 1 ? 's' : ''}
                     </div>
+                  </div>
+                  <div className="rounded-lg border border-stone-200 bg-white p-3">
+                    <div className="font-mono text-lg font-semibold text-sky-900 tabular-nums">
+                      {book.held24hCopies}
+                    </div>
+                    <div className="text-xs text-stone-600">Retenus 24 h</div>
                   </div>
                   <div className="rounded-lg border border-stone-200 bg-white p-3">
                     <div className="font-mono text-lg font-semibold text-stone-900 tabular-nums">
@@ -517,7 +425,7 @@ export function BookDetailPage({
                     <div className="font-mono text-lg font-semibold text-stone-900 tabular-nums">
                       {book.reservedCopies}
                     </div>
-                    <div className="text-xs text-stone-600">En attente retrait</div>
+                    <div className="text-xs text-stone-600">Retrait FIFO (3 j)</div>
                   </div>
                   <div className="rounded-lg border border-stone-200 bg-white p-3">
                     <div className="font-mono text-lg font-semibold text-stone-900 tabular-nums">
@@ -530,99 +438,99 @@ export function BookDetailPage({
             )}
           </div>
 
-          {/* Exemplaires physiques : cartes compactes sur téléphone (zéro scroll horizontal), tableau sur >= md */}
-          <div>
-            <h2 className="font-editorial text-xl font-semibold text-stone-950">
-              Exemplaires physiques ({book.copies.length})
-            </h2>
-            <p className="mt-1 text-xs text-stone-500">
-              Chaque code-barres correspond à un exemplaire physique indépendant.
-            </p>
+          {/* Liste des codes-barres physiques strictement réservée au personnel autorisé */}
+          {isLibrarian && (
+            <div>
+              <h2 className="font-editorial text-xl font-semibold text-stone-950">
+                Exemplaires physiques — Vue personnel ({book.copies.length})
+              </h2>
+              <p className="mt-1 text-xs text-stone-500">
+                Ces codes-barres individuels sont réservés au personnel de la bibliothèque pour le suivi et la validation au comptoir.
+              </p>
 
-            {book.copies.length === 0 ? (
-              <div className="mt-4 rounded-lg border border-stone-200 p-6 text-sm text-stone-600">
-                Aucun exemplaire physique enregistré pour ce titre.
-              </div>
-            ) : (
-              <>
-                {/* Vue mobile en cartes compactes */}
-                <div className="mt-4 space-y-2.5 md:hidden">
-                  {book.copies.map((copy) => {
-                    const st = getCopyStatusDisplay(copy.status);
-                    const Icon = st.icon;
-                    return (
-                      <div
-                        key={copy.id}
-                        className="rounded-xl border border-stone-200 bg-white p-3.5 space-y-2"
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <span className="font-mono text-xs font-semibold text-stone-900">
-                            {copy.barcode}
-                          </span>
-                          <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${st.color}`}>
-                            <Icon className="h-3.5 w-3.5 shrink-0" />
-                            {st.label}
-                          </span>
-                        </div>
-                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-stone-600">
-                          <span>
-                            État : {copy.physicalCondition}
-                            {copy.needsInspection && copy.status === 'En réparation'
-                              ? ' (inspection requise)'
-                              : ''}
-                          </span>
-                          <span aria-hidden="true">·</span>
-                          <span>{copy.location}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
+              {book.copies.length === 0 ? (
+                <div className="mt-4 rounded-lg border border-stone-200 p-6 text-sm text-stone-600">
+                  Aucun exemplaire physique enregistré pour ce titre.
                 </div>
-
-                {/* Vue tablette / ordinateur en tableau */}
-                <div className="mt-4 hidden md:block rounded-xl border border-stone-200 overflow-x-auto">
-                  <table className="w-full text-left text-sm">
-                    <thead className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-700">
-                      <tr>
-                        <th className="px-4 py-3">Code-barres</th>
-                        <th className="px-4 py-3">Statut</th>
-                        <th className="px-4 py-3">État physique</th>
-                        <th className="px-4 py-3">Localisation</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-stone-100 bg-white">
-                      {book.copies.map((copy) => {
-                        const st = getCopyStatusDisplay(copy.status);
-                        const Icon = st.icon;
-                        return (
-                          <tr key={copy.id} className="hover:bg-stone-50/70">
-                            <td className="px-4 py-3 font-mono text-xs font-medium text-stone-900">
+              ) : (
+                <>
+                  <div className="mt-4 space-y-2.5 md:hidden">
+                    {book.copies.map((copy) => {
+                      const st = getCopyStatusDisplay(copy.status);
+                      const Icon = st.icon;
+                      return (
+                        <div
+                          key={copy.id}
+                          className="rounded-xl border border-stone-200 bg-white p-3.5 space-y-2"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-mono text-xs font-semibold text-stone-900">
                               {copy.barcode}
-                            </td>
-                            <td className="px-4 py-3">
-                              <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${st.color}`}>
-                                <Icon className="h-3.5 w-3.5 shrink-0" />
-                                {st.label}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 text-xs text-stone-700">
-                              {copy.physicalCondition}
-                              {copy.needsInspection && copy.status === 'En réparation' && (
-                                <span className="ml-1.5 text-stone-500">(inspection requise)</span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3 text-xs text-stone-600">
-                              {copy.location}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
-          </div>
+                            </span>
+                            <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${st.color}`}>
+                              <Icon className="h-3.5 w-3.5 shrink-0" />
+                              {st.label}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-stone-600">
+                            <span>
+                              État : {copy.physicalCondition}
+                              {copy.needsInspection && copy.status === 'En réparation'
+                                ? ' (inspection requise)'
+                                : ''}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span>{copy.location}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="mt-4 hidden md:block rounded-xl border border-stone-200 overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-700">
+                        <tr>
+                          <th className="px-4 py-3">Code-barres</th>
+                          <th className="px-4 py-3">Statut</th>
+                          <th className="px-4 py-3">État physique</th>
+                          <th className="px-4 py-3">Localisation</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-stone-100 bg-white">
+                        {book.copies.map((copy) => {
+                          const st = getCopyStatusDisplay(copy.status);
+                          const Icon = st.icon;
+                          return (
+                            <tr key={copy.id} className="hover:bg-stone-50/70">
+                              <td className="px-4 py-3 font-mono text-xs font-medium text-stone-900">
+                                {copy.barcode}
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${st.color}`}>
+                                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                                  {st.label}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-xs text-stone-700">
+                                {copy.physicalCondition}
+                                {copy.needsInspection && copy.status === 'En réparation' && (
+                                  <span className="ml-1.5 text-stone-500">(inspection requise)</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-xs text-stone-600">
+                                {copy.location}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

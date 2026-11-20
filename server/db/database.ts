@@ -4,7 +4,8 @@ import Database from 'better-sqlite3';
 import { hashPassword } from '../auth/password.ts';
 
 export function createDatabase(dbPath?: string): Database.Database {
-  const targetPath = dbPath || process.env.DB_PATH || path.resolve(process.cwd(), 'data', 'biblioest.db');
+  const targetPath =
+    dbPath || process.env.DB_PATH || path.resolve(process.cwd(), 'data', 'biblioest.db');
   if (targetPath !== ':memory:') {
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   }
@@ -29,6 +30,8 @@ export function initSchema(db: Database.Database): void {
       institution TEXT NOT NULL,
       studentStatus TEXT NOT NULL CHECK (studentStatus IN ('verifie', 'en_attente', 'non_est', 'suspendu')),
       accountStatus TEXT NOT NULL CHECK (accountStatus IN ('actif', 'suspendu')),
+      emailVerified INTEGER NOT NULL DEFAULT 1,
+      isAdmin INTEGER NOT NULL DEFAULT 0,
       cne TEXT,
       filiere TEXT,
       authSource TEXT NOT NULL DEFAULT 'local' CHECK (authSource IN ('local', 'usmba_sso', 'google_oidc')),
@@ -59,7 +62,7 @@ export function initSchema(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       bookId TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
       barcode TEXT NOT NULL UNIQUE,
-      status TEXT NOT NULL CHECK (status IN ('Disponible', 'Emprunté', 'Réservé', 'En réparation', 'Retiré définitivement')),
+      status TEXT NOT NULL CHECK (status IN ('Disponible', 'Retenu 24h', 'Emprunté', 'Réservé', 'En réparation', 'Retiré définitivement')),
       physicalCondition TEXT NOT NULL CHECK (physicalCondition IN ('Neuf', 'Bon état', 'Usure légère', 'Endommagé', 'Hors service')),
       location TEXT NOT NULL,
       needsInspection INTEGER NOT NULL DEFAULT 0,
@@ -83,13 +86,31 @@ export function initSchema(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       memberId TEXT NOT NULL REFERENCES users(id),
       bookId TEXT NOT NULL REFERENCES books(id),
+      requestType TEXT NOT NULL DEFAULT 'reservation_fifo' CHECK (requestType IN ('retenue_24h', 'reservation_fifo')),
       requestedAt TEXT NOT NULL,
       queuePosition INTEGER,
-      status TEXT NOT NULL CHECK (status IN ('En attente', 'Exemplaire attribué', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
+      status TEXT NOT NULL CHECK (status IN ('En attente', 'Retenu 24h', 'Exemplaire attribué', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
       assignedCopyId TEXT REFERENCES copies(id),
       availableAt TEXT,
       pickupDeadline TEXT,
       completedAt TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS copy_state_logs (
+      id TEXT PRIMARY KEY,
+      copyId TEXT NOT NULL REFERENCES copies(id) ON DELETE CASCADE,
+      copyBarcode TEXT NOT NULL,
+      bookId TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+      bookTitle TEXT NOT NULL,
+      oldStatus TEXT,
+      newStatus TEXT NOT NULL,
+      memberId TEXT,
+      memberName TEXT,
+      agentId TEXT,
+      agentName TEXT,
+      requestOrLoanId TEXT,
+      summary TEXT NOT NULL,
+      createdAt TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS notifications (
@@ -123,6 +144,39 @@ export function initSchema(db: Database.Database): void {
       createdAt TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS email_verification_codes (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expiresAt TEXT NOT NULL,
+      consumedAt TEXT,
+      createdAt TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS library_settings (
+      id TEXT PRIMARY KEY,
+      borrowingDurationDays INTEGER NOT NULL DEFAULT 7,
+      pickupWindowDays INTEGER NOT NULL DEFAULT 3,
+      maxQuantityPerTitle INTEGER NOT NULL DEFAULT 1,
+      realEmailsEnabled INTEGER NOT NULL DEFAULT 1,
+      testEmailRecipient TEXT NOT NULL DEFAULT 'bilale.zorgane@usmba.ac.ma'
+    );
+
+    CREATE TABLE IF NOT EXISTS simulated_outbox (
+      id TEXT PRIMARY KEY,
+      recipientEmail TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      body TEXT NOT NULL,
+      category TEXT NOT NULL CHECK (category IN ('verification', 'rappel_retard', 'retrait', 'test')),
+      createdAt TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS demo_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_copies_book_status ON copies(bookId, status);
     CREATE INDEX IF NOT EXISTS idx_loans_member_status ON loans(memberId, status);
     CREATE INDEX IF NOT EXISTS idx_loans_copy_status ON loans(copyId, status);
@@ -130,9 +184,25 @@ export function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, createdAt DESC);
     CREATE INDEX IF NOT EXISTS idx_cart_items_user ON cart_items(userId, addedAt ASC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(createdAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_copy_state_logs_created ON copy_state_logs(createdAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_email_codes_user ON email_verification_codes(userId, createdAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_sim_outbox_created ON simulated_outbox(createdAt DESC);
   `);
 
   migrateExistingSchemaIfNeeded(db);
+  ensureDefaultSettings(db, false);
+}
+
+export function ensureDefaultSettings(db: Database.Database, isDemoDb = false): void {
+  const existing = db
+    .prepare(`SELECT id FROM library_settings WHERE id = 'default'`)
+    .get() as { id: string } | undefined;
+  if (!existing) {
+    db.prepare(
+      `INSERT INTO library_settings (id, borrowingDurationDays, pickupWindowDays, maxQuantityPerTitle, realEmailsEnabled, testEmailRecipient)
+       VALUES ('default', 7, 3, 1, ?, ?)`
+    ).run(isDemoDb ? 0 : 1, isDemoDb ? 'test.demo@usmba.example' : 'bilale.zorgane@usmba.ac.ma');
+  }
 }
 
 function migrateExistingSchemaIfNeeded(db: Database.Database): void {
@@ -141,6 +211,8 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
     .get() as { sql?: string } | undefined;
   const usersCols = db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>;
   const hasUserIsDemo = usersCols.some((c) => c.name === 'isDemo');
+  const hasEmailVerified = usersCols.some((c) => c.name === 'emailVerified');
+  const hasIsAdmin = usersCols.some((c) => c.name === 'isAdmin');
   const hasGoogleOidcCheck = Boolean(usersSqlRow?.sql?.includes('google_oidc'));
 
   if (!hasUserIsDemo || !hasGoogleOidcCheck) {
@@ -156,6 +228,8 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
           institution TEXT NOT NULL,
           studentStatus TEXT NOT NULL CHECK (studentStatus IN ('verifie', 'en_attente', 'non_est', 'suspendu')),
           accountStatus TEXT NOT NULL CHECK (accountStatus IN ('actif', 'suspendu')),
+          emailVerified INTEGER NOT NULL DEFAULT 1,
+          isAdmin INTEGER NOT NULL DEFAULT 0,
           cne TEXT,
           filiere TEXT,
           authSource TEXT NOT NULL DEFAULT 'local' CHECK (authSource IN ('local', 'usmba_sso', 'google_oidc')),
@@ -163,10 +237,14 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
           createdAt TEXT NOT NULL
         );
       `);
-      const selectDemoExpr = hasUserIsDemo ? 'isDemo' : `CASE WHEN authSource = 'local' THEN 1 ELSE 0 END`;
+      const selectDemoExpr = hasUserIsDemo
+        ? 'isDemo'
+        : `CASE WHEN authSource = 'local' THEN 1 ELSE 0 END`;
+      const selectEmailVerifiedExpr = hasEmailVerified ? 'emailVerified' : '1';
+      const selectIsAdminExpr = hasIsAdmin ? 'isAdmin' : '0';
       db.exec(`
-        INSERT INTO users_migrated (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt)
-        SELECT id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, ${selectDemoExpr}, createdAt
+        INSERT INTO users_migrated (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt)
+        SELECT id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, ${selectEmailVerifiedExpr}, ${selectIsAdminExpr}, cne, filiere, authSource, ${selectDemoExpr}, createdAt
         FROM users;
         DROP TABLE users;
         ALTER TABLE users_migrated RENAME TO users;
@@ -174,6 +252,13 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
     });
     migrateUsers();
     db.pragma('foreign_keys = ON');
+  } else {
+    if (!hasEmailVerified) {
+      db.exec(`ALTER TABLE users ADD COLUMN emailVerified INTEGER NOT NULL DEFAULT 1`);
+    }
+    if (!hasIsAdmin) {
+      db.exec(`ALTER TABLE users ADD COLUMN isAdmin INTEGER NOT NULL DEFAULT 0`);
+    }
   }
 
   // Remplacer toute donnée personnelle ou adresse seed héritée par les profils fictifs explicites
@@ -183,6 +268,7 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
     ['usr-youssef', 'Youssef Mansouri (Démo)', 'youssef.demo@usmba.example'],
     ['usr-karim', 'Karim Berrada (Démo)', 'karim.demo@usmba.example'],
     ['usr-lib', 'Nadia Benali (Démo)', 'bibliothecaire.demo@est-usmba.example'],
+    ['usr-admin', 'Hassan Tazi (Admin Démo)', 'admin.demo@est-usmba.example'],
   ];
   const updateDemoStmt = db.prepare(
     `UPDATE users SET fullName = ?, email = ?, isDemo = 1 WHERE id = ? AND authSource = 'local'`
@@ -199,27 +285,65 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
     ).run();
   }
 
+  const copiesSqlRow = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'copies'`)
+    .get() as { sql?: string } | undefined;
+  if (copiesSqlRow?.sql && !copiesSqlRow.sql.includes('Retenu 24h')) {
+    db.pragma('foreign_keys = OFF');
+    const migrateCopies = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE copies_migrated (
+          id TEXT PRIMARY KEY,
+          bookId TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+          barcode TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL CHECK (status IN ('Disponible', 'Retenu 24h', 'Emprunté', 'Réservé', 'En réparation', 'Retiré définitivement')),
+          physicalCondition TEXT NOT NULL CHECK (physicalCondition IN ('Neuf', 'Bon état', 'Usure légère', 'Endommagé', 'Hors service')),
+          location TEXT NOT NULL,
+          needsInspection INTEGER NOT NULL DEFAULT 0,
+          createdAt TEXT NOT NULL
+        );
+        INSERT INTO copies_migrated (id, bookId, barcode, status, physicalCondition, location, needsInspection, createdAt)
+        SELECT id, bookId, barcode, status, physicalCondition, location, needsInspection, createdAt
+        FROM copies;
+        DROP TABLE copies;
+        ALTER TABLE copies_migrated RENAME TO copies;
+        CREATE INDEX IF NOT EXISTS idx_copies_book_status ON copies(bookId, status);
+      `);
+    });
+    migrateCopies();
+    db.pragma('foreign_keys = ON');
+  }
+
   const resSqlRow = db
     .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reservations'`)
     .get() as { sql?: string } | undefined;
-  if (resSqlRow?.sql && !resSqlRow.sql.includes('Exemplaire attribué')) {
+  const resCols = db.prepare(`PRAGMA table_info(reservations)`).all() as Array<{ name: string }>;
+  const hasRequestType = resCols.some((c) => c.name === 'requestType');
+  if (
+    resSqlRow?.sql &&
+    (!resSqlRow.sql.includes('Exemplaire attribué') ||
+      !resSqlRow.sql.includes('Retenu 24h') ||
+      !hasRequestType)
+  ) {
     db.pragma('foreign_keys = OFF');
     const migrateRes = db.transaction(() => {
+      const requestTypeExpr = hasRequestType ? `COALESCE(requestType, 'reservation_fifo')` : `'reservation_fifo'`;
       db.exec(`
         CREATE TABLE reservations_migrated (
           id TEXT PRIMARY KEY,
           memberId TEXT NOT NULL REFERENCES users(id),
           bookId TEXT NOT NULL REFERENCES books(id),
+          requestType TEXT NOT NULL DEFAULT 'reservation_fifo' CHECK (requestType IN ('retenue_24h', 'reservation_fifo')),
           requestedAt TEXT NOT NULL,
           queuePosition INTEGER,
-          status TEXT NOT NULL CHECK (status IN ('En attente', 'Exemplaire attribué', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
+          status TEXT NOT NULL CHECK (status IN ('En attente', 'Retenu 24h', 'Exemplaire attribué', 'Disponible pour retrait', 'Retirée', 'Annulée', 'Expirée')),
           assignedCopyId TEXT REFERENCES copies(id),
           availableAt TEXT,
           pickupDeadline TEXT,
           completedAt TEXT
         );
-        INSERT INTO reservations_migrated (id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
-        SELECT id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt
+        INSERT INTO reservations_migrated (id, memberId, bookId, requestType, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
+        SELECT id, memberId, bookId, ${requestTypeExpr}, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt
         FROM reservations;
         DROP TABLE reservations;
         ALTER TABLE reservations_migrated RENAME TO reservations;
@@ -231,9 +355,16 @@ function migrateExistingSchemaIfNeeded(db: Database.Database): void {
   }
 }
 
-export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new Date()): void {
+export function seedDatabaseIfEmpty(
+  db: Database.Database,
+  nowDate: Date = new Date(),
+  options?: { isDemoSandbox?: boolean }
+): void {
   const existingUsers = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
-  if (existingUsers.count > 0) return;
+  if (existingUsers.count > 0) {
+    ensureDefaultSettings(db, Boolean(options?.isDemoSandbox));
+    return;
+  }
 
   const isoOffset = (daysOffset: number): string => {
     return new Date(nowDate.getTime() + daysOffset * 24 * 60 * 60 * 1000).toISOString();
@@ -241,8 +372,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
 
   const seed = db.transaction(() => {
     const insertUser = db.prepare(`
-      INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt)
-      VALUES (@id, @fullName, @email, @passwordHash, @role, @institution, @studentStatus, @accountStatus, @cne, @filiere, @authSource, @isDemo, @createdAt)
+      INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt)
+      VALUES (@id, @fullName, @email, @passwordHash, @role, @institution, @studentStatus, @accountStatus, @emailVerified, @isAdmin, @cne, @filiere, @authSource, @isDemo, @createdAt)
     `);
 
     const demoLocalHash = hashPassword('DemoBiblioEST2026!');
@@ -257,6 +388,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
+        emailVerified: 1,
+        isAdmin: 0,
         cne: 'DEMO-N001',
         filiere: 'Génie Informatique',
         authSource: 'local',
@@ -272,6 +405,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
+        emailVerified: 1,
+        isAdmin: 0,
         cne: 'DEMO-N002',
         filiere: 'Génie Informatique',
         authSource: 'local',
@@ -287,6 +422,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
+        emailVerified: 1,
+        isAdmin: 0,
         cne: 'DEMO-N003',
         filiere: 'Génie Électrique',
         authSource: 'local',
@@ -302,6 +439,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         institution: 'EST Fès',
         studentStatus: 'en_attente',
         accountStatus: 'actif',
+        emailVerified: 1,
+        isAdmin: 0,
         cne: 'DEMO-N004',
         filiere: 'Techniques de Management',
         authSource: 'local',
@@ -317,11 +456,30 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         institution: 'EST Fès',
         studentStatus: 'verifie',
         accountStatus: 'actif',
+        emailVerified: 1,
+        isAdmin: 0,
         cne: null,
         filiere: 'Direction de la Bibliothèque EST Fès',
         authSource: 'local',
         isDemo: 1,
         createdAt: isoOffset(-120),
+      },
+      {
+        id: 'usr-admin',
+        fullName: 'Hassan Tazi (Admin Démo)',
+        email: 'admin.demo@est-usmba.example',
+        passwordHash: demoLocalHash,
+        role: 'bibliothecaire',
+        institution: 'EST Fès',
+        studentStatus: 'verifie',
+        accountStatus: 'actif',
+        emailVerified: 1,
+        isAdmin: 1,
+        cne: null,
+        filiere: 'Administration Bibliothèque EST Fès',
+        authSource: 'local',
+        isDemo: 1,
+        createdAt: isoOffset(-150),
       },
     ];
 
@@ -469,7 +627,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
     `);
 
     const copies = [
-      // bk-algo: 2 available, 1 borrowed
       {
         id: 'cp-algo-1',
         bookId: 'bk-algo',
@@ -500,8 +657,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         needsInspection: 0,
         createdAt: isoOffset(-40),
       },
-
-      // bk-sys-dist: 0 available! 2 borrowed (great for testing reservation!)
       {
         id: 'cp-sys-1',
         bookId: 'bk-sys-dist',
@@ -522,8 +677,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         needsInspection: 0,
         createdAt: isoOffset(-15),
       },
-
-      // bk-auto: 1 available, 1 in repair
       {
         id: 'cp-auto-1',
         bookId: 'bk-auto',
@@ -544,8 +697,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         needsInspection: 1,
         createdAt: isoOffset(-30),
       },
-
-      // bk-elec-puiss: 1 available, 1 permanently withdrawn
       {
         id: 'cp-elec-1',
         bookId: 'bk-elec-puiss',
@@ -566,8 +717,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         needsInspection: 0,
         createdAt: isoOffset(-25),
       },
-
-      // bk-comptabilite: 2 available
       {
         id: 'cp-compta-1',
         bookId: 'bk-comptabilite',
@@ -582,14 +731,12 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         id: 'cp-compta-2',
         bookId: 'bk-comptabilite',
         barcode: 'EST-TMG-0402',
-        status: 'Disponible',
+        status: 'Retenu 24h',
         physicalCondition: 'Bon état',
-        location: 'Salle Économie · TMG-01-D',
+        location: 'Banque d’accueil · Retrait 24h',
         needsInspection: 0,
         createdAt: isoOffset(-12),
       },
-
-      // bk-meca: 1 available, 1 permanently withdrawn
       {
         id: 'cp-meca-1',
         bookId: 'bk-meca',
@@ -600,8 +747,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         needsInspection: 0,
         createdAt: isoOffset(-20),
       },
-
-      // bk-maths: 1 available, 1 reserved (awaiting pickup for Salma!)
       {
         id: 'cp-maths-1',
         bookId: 'bk-maths',
@@ -632,7 +777,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
     `);
 
     const loans = [
-      // Salma active loan on cp-algo-3 (due in 5 days)
       {
         id: 'ln-salma-1',
         memberId: 'usr-salma',
@@ -645,7 +789,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         returnNotes: null,
         status: 'En cours',
       },
-      // Bilale active loan on cp-sys-1 (due in 4 days)
       {
         id: 'ln-bilale-1',
         memberId: 'usr-bilale',
@@ -658,7 +801,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         returnNotes: null,
         status: 'En cours',
       },
-      // Youssef overdue loan on cp-sys-2 (due 3 days ago -> blocks borrowing/reserving!)
       {
         id: 'ln-youssef-overdue',
         memberId: 'usr-youssef',
@@ -671,7 +813,6 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         returnNotes: null,
         status: 'En retard',
       },
-      // Completed historical loan for Salma
       {
         id: 'ln-salma-past',
         memberId: 'usr-salma',
@@ -689,8 +830,8 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
     for (const l of loans) insertLoan.run(l);
 
     const insertReservation = db.prepare(`
-      INSERT INTO reservations (id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
-      VALUES (@id, @memberId, @bookId, @requestedAt, @queuePosition, @status, @assignedCopyId, @availableAt, @pickupDeadline, @completedAt)
+      INSERT INTO reservations (id, memberId, bookId, requestType, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
+      VALUES (@id, @memberId, @bookId, @requestType, @requestedAt, @queuePosition, @status, @assignedCopyId, @availableAt, @pickupDeadline, @completedAt)
     `);
 
     const reservations = [
@@ -698,6 +839,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         id: 'res-salma-maths',
         memberId: 'usr-salma',
         bookId: 'bk-maths',
+        requestType: 'reservation_fifo',
         requestedAt: isoOffset(-2),
         queuePosition: null,
         status: 'Disponible pour retrait',
@@ -710,6 +852,7 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         id: 'res-salma-sys',
         memberId: 'usr-salma',
         bookId: 'bk-sys-dist',
+        requestType: 'reservation_fifo',
         requestedAt: isoOffset(-1),
         queuePosition: 1,
         status: 'En attente',
@@ -718,9 +861,42 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
         pickupDeadline: null,
         completedAt: null,
       },
+      {
+        id: 'res-amine-compta-24h',
+        memberId: 'usr-bilale',
+        bookId: 'bk-comptabilite',
+        requestType: 'retenue_24h',
+        requestedAt: nowDate.toISOString(),
+        queuePosition: null,
+        status: 'Retenu 24h',
+        assignedCopyId: 'cp-compta-2',
+        availableAt: nowDate.toISOString(),
+        pickupDeadline: isoOffset(1),
+        completedAt: null,
+      },
     ];
 
     for (const r of reservations) insertReservation.run(r);
+
+    db.prepare(`
+      INSERT INTO copy_state_logs (id, copyId, copyBarcode, bookId, bookTitle, oldStatus, newStatus, memberId, memberName, agentId, agentName, requestOrLoanId, summary, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'csl-seed-1',
+      'cp-compta-2',
+      'EST-TMG-0402',
+      'bk-comptabilite',
+      'Comptabilité Analytique et Contrôle de Gestion',
+      'Disponible',
+      'Retenu 24h',
+      'usr-bilale',
+      'Amine El Fassi (Démo)',
+      'usr-bilale',
+      'Amine El Fassi (Démo)',
+      'res-amine-compta-24h',
+      'Retenue 24 h créée lors de la validation du panier de demandes.',
+      nowDate.toISOString()
+    );
 
     const insertNotif = db.prepare(`
       INSERT INTO notifications (id, userId, title, message, type, createdAt, readAt)
@@ -761,7 +937,37 @@ export function seedDatabaseIfEmpty(db: Database.Database, nowDate: Date = new D
     ];
 
     for (const n of notifications) insertNotif.run(n);
+
+    ensureDefaultSettings(db, Boolean(options?.isDemoSandbox));
+    if (options?.isDemoSandbox) {
+      db.prepare(`INSERT OR REPLACE INTO demo_meta (key, value) VALUES ('clock_offset_days', '0')`).run();
+      db.prepare(`INSERT OR REPLACE INTO demo_meta (key, value) VALUES ('clock_offset_hours', '0')`).run();
+    }
   });
 
   seed();
+}
+
+export function resetDemoDatabase(demoDb: Database.Database, nowDate: Date = new Date()): void {
+  const tx = demoDb.transaction(() => {
+    demoDb.pragma('foreign_keys = OFF');
+    demoDb.exec(`
+      DELETE FROM email_verification_codes;
+      DELETE FROM simulated_outbox;
+      DELETE FROM demo_meta;
+      DELETE FROM copy_state_logs;
+      DELETE FROM cart_items;
+      DELETE FROM audit_logs;
+      DELETE FROM notifications;
+      DELETE FROM reservations;
+      DELETE FROM loans;
+      DELETE FROM copies;
+      DELETE FROM books;
+      DELETE FROM users;
+      DELETE FROM library_settings;
+    `);
+    demoDb.pragma('foreign_keys = ON');
+  });
+  tx();
+  seedDatabaseIfEmpty(demoDb, nowDate, { isDemoSandbox: true });
 }

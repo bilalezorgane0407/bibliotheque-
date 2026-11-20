@@ -12,7 +12,19 @@ async function startServer() {
   const db = createDatabase();
   seedDatabaseIfEmpty(db);
 
-  const { app } = createApp(db);
+  const demoEnabled =
+    process.env.DISABLE_DEMO_MODE !== 'true' &&
+    (process.env.NODE_ENV !== 'production' || process.env.ENABLE_DEMO_IN_PROD === 'true');
+  const demoDb = demoEnabled
+    ? createDatabase(
+        process.env.DEMO_DB_PATH || path.resolve(process.cwd(), 'data', 'biblioest-demo.db')
+      )
+    : undefined;
+  if (demoDb) {
+    seedDatabaseIfEmpty(demoDb, new Date(), { isDemoSandbox: true });
+  }
+
+  const { app } = createApp(db, () => new Date(), undefined, demoDb);
   const httpServer = http.createServer(app);
 
   if (process.env.NODE_ENV !== 'production') {

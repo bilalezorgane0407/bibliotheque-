@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useState } from 'react';
+import { FlaskConical, RotateCcw } from 'lucide-react';
 import type {
   BookWithStats,
   CartItemRecord,
+  DemoState,
   EligibilityReport,
   GoogleAuthStatus,
+  LibrarySettings,
   NotificationRecord,
   UserPublic,
 } from '../shared/types.ts';
-import { ApiError, api, isCrossSiteIframe } from './lib/api.ts';
+import { ApiError, api, formatDateTimeFr, isCrossSiteIframe } from './lib/api.ts';
+import { firebaseSignOut } from './lib/firebaseAuth.ts';
 import { Navbar, type AppPage } from './components/Navbar.tsx';
 import { HomePage } from './components/HomePage.tsx';
 import { CataloguePage } from './components/CataloguePage.tsx';
@@ -18,6 +22,7 @@ import { ReservationsPage } from './components/ReservationsPage.tsx';
 import { ProfileNotificationsPage } from './components/ProfileNotificationsPage.tsx';
 import { LibrarianDashboard } from './components/LibrarianDashboard.tsx';
 import { AuthView } from './components/AuthView.tsx';
+import { DemoPanel } from './components/DemoPanel.tsx';
 
 export default function App() {
   const [page, setPage] = useState<AppPage>('home');
@@ -31,7 +36,13 @@ export default function App() {
   const [user, setUser] = useState<UserPublic | null>(null);
   const [eligibility, setEligibility] = useState<EligibilityReport | null>(null);
   const [googleAuth, setGoogleAuth] = useState<GoogleAuthStatus | null>(null);
-  const [demoModeEnabled, setDemoModeEnabled] = useState<boolean>(true);
+  const [demoModeEnabled, setDemoModeEnabled] = useState<boolean>(false);
+  const [isDemoSession, setIsDemoSession] = useState<boolean>(false);
+  const [simulatedNow, setSimulatedNow] = useState<string | null>(null);
+  const [settings, setSettings] = useState<LibrarySettings | null>(null);
+  const [demoState, setDemoState] = useState<DemoState | null>(null);
+  const [demoPanelOpen, setDemoPanelOpen] = useState(false);
+
   const [books, setBooks] = useState<BookWithStats[]>([]);
   const [booksLoading, setBooksLoading] = useState(true);
   const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
@@ -41,6 +52,20 @@ export default function App() {
     message: string;
   } | null>(null);
 
+  const refreshDemoState = async (enabledFlag?: boolean) => {
+    const enabled = enabledFlag ?? demoModeEnabled;
+    if (!enabled) {
+      setDemoState(null);
+      return;
+    }
+    try {
+      const state = await api.getDemoState();
+      setDemoState(state);
+    } catch {
+      setDemoState(null);
+    }
+  };
+
   const refreshSessionAndNotifications = async () => {
     try {
       const me = await api.getMe();
@@ -48,6 +73,15 @@ export default function App() {
       setEligibility(me.eligibility);
       setGoogleAuth(me.googleAuth);
       setDemoModeEnabled(me.demoModeEnabled);
+      setIsDemoSession(Boolean(me.isDemoSession));
+      setSimulatedNow(me.simulatedNow || null);
+      setSettings(me.settings || null);
+
+      if (me.demoModeEnabled) {
+        void refreshDemoState(true);
+      } else {
+        setDemoState(null);
+      }
 
       if (me.user) {
         const [notifRes, cartRes] = await Promise.all([
@@ -63,6 +97,8 @@ export default function App() {
     } catch {
       setUser(null);
       setEligibility(null);
+      setIsDemoSession(false);
+      setSimulatedNow(null);
       setNotifications([]);
       setCartItems([]);
     }
@@ -83,6 +119,7 @@ export default function App() {
   useEffect(() => {
     void refreshSessionAndNotifications();
     void refreshHomeBooks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const navigate = (nextPage: AppPage) => {
@@ -136,7 +173,7 @@ export default function App() {
     }
   };
 
-  const handleAuthenticated = async () => {
+  const handleAuthenticated = async (preferredPage?: AppPage) => {
     const me = await api.getMe();
     if (!me.user) {
       if (isCrossSiteIframe() && !me.cookieReceived) {
@@ -156,21 +193,56 @@ export default function App() {
     setEligibility(me.eligibility);
     setGoogleAuth(me.googleAuth);
     setDemoModeEnabled(me.demoModeEnabled);
+    setIsDemoSession(Boolean(me.isDemoSession));
+    setSimulatedNow(me.simulatedNow || null);
+    setSettings(me.settings || null);
+
     const [notifRes, cartRes] = await Promise.all([
       api.getMyNotifications(),
       api.getCart(),
+      refreshHomeBooks(),
+      me.demoModeEnabled ? refreshDemoState(true) : Promise.resolve(),
     ]);
     setNotifications(notifRes.notifications);
     setCartItems(cartRes.items);
-    setPage(me.user.role === 'bibliothecaire' ? 'admin' : 'home');
+
+    if (preferredPage && (preferredPage !== 'admin' || me.user.role === 'bibliothecaire')) {
+      setPage(preferredPage);
+    } else {
+      setPage(me.user.role === 'bibliothecaire' ? 'admin' : 'home');
+    }
+  };
+
+  const handleSwitchDemoProfile = async (userId: string, navigateTo?: AppPage) => {
+    await api.demoLogin(userId);
+    await handleAuthenticated(navigateTo);
+  };
+
+  const handleResetDemo = async () => {
+    const freshState = await api.demoReset();
+    setDemoState(freshState);
+    await Promise.all([refreshSessionAndNotifications(), refreshHomeBooks()]);
+  };
+
+  const handleAdvanceClock = async (
+    payload: { addHours?: number; addDays?: number } | null
+  ) => {
+    const nextState = await api.demoAdvanceClock(
+      payload === null ? { setOffsetHours: 0 } : payload
+    );
+    setDemoState(nextState);
+    await Promise.all([refreshSessionAndNotifications(), refreshHomeBooks()]);
   };
 
   const handleLogout = async () => {
-    await api.logout();
+    await Promise.allSettled([api.logout(), firebaseSignOut()]);
     setUser(null);
     setEligibility(null);
+    setIsDemoSession(false);
+    setSimulatedNow(null);
     setNotifications([]);
     setCartItems([]);
+    await refreshHomeBooks();
     setPage('home');
   };
 
@@ -189,6 +261,87 @@ export default function App() {
         cartCount={cartItems.length}
         onNavigate={navigate}
       />
+
+      {demoModeEnabled && (
+        <div
+          className={`border-b ${
+            isDemoSession
+              ? 'border-amber-300 bg-amber-50/90 text-amber-950'
+              : 'border-stone-200 bg-stone-50 text-stone-700'
+          }`}
+        >
+          <div className="mx-auto flex max-w-7xl flex-col gap-2 px-4 py-2 text-xs sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+              <FlaskConical
+                className={`h-3.5 w-3.5 shrink-0 ${
+                  isDemoSession ? 'text-amber-800' : 'text-stone-600'
+                }`}
+              />
+              {isDemoSession ? (
+                <span>
+                  <strong>Mode Démo actif</strong> · Bac à sable isolé (.example) · Aucun vrai e-mail envoyé
+                  {simulatedNow && (
+                    <span className="ml-1.5 font-mono text-[11px] tabular-nums">
+                      · Horloge : {formatDateTimeFr(simulatedNow)}
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span>
+                  Mode Démo disponible (comptes fictifs <span className="font-mono">.example</span> isolés des données réelles)
+                </span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {isDemoSession && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void handleAdvanceClock({ addHours: 25 })}
+                    className="min-h-[32px] rounded border border-amber-300 bg-white px-2.5 font-mono text-[11px] font-semibold text-amber-950 hover:bg-amber-100/60 cursor-pointer"
+                  >
+                    +25 h
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleAdvanceClock({ addDays: 1 })}
+                    className="min-h-[32px] rounded border border-amber-300 bg-white px-2.5 font-mono text-[11px] font-semibold text-amber-950 hover:bg-amber-100/60 cursor-pointer"
+                  >
+                    +1 j
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleAdvanceClock({ addDays: 4 })}
+                    className="min-h-[32px] rounded border border-amber-300 bg-white px-2.5 font-mono text-[11px] font-semibold text-amber-950 hover:bg-amber-100/60 cursor-pointer"
+                  >
+                    +4 j
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleResetDemo()}
+                    className="inline-flex min-h-[32px] items-center gap-1 rounded border border-amber-300 bg-white px-2.5 text-[11px] font-semibold text-amber-950 hover:bg-amber-100/60 cursor-pointer"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    Réinitialiser la démo
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setDemoPanelOpen(true)}
+                className={`min-h-[32px] rounded px-3 text-[11px] font-semibold cursor-pointer ${
+                  isDemoSession
+                    ? 'bg-amber-900 text-white hover:bg-amber-950'
+                    : 'border border-stone-300 bg-white text-stone-900 hover:border-emerald-900'
+                }`}
+              >
+                {isDemoSession ? 'Scénarios & Profils Démo' : 'Ouvrir Mode Démo'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {cartNotice && (page === 'catalogue' || page === 'home') && (
         <div className="border-b border-stone-200 bg-stone-50">
@@ -261,9 +414,6 @@ export default function App() {
             inCart={cartBookIds.has(selectedBookId)}
             onBack={() => navigate('catalogue')}
             onRequireAuth={() => navigate('auth')}
-            onOperationComplete={async () => {
-              await Promise.all([refreshSessionAndNotifications(), refreshHomeBooks()]);
-            }}
             onAddToCart={
               user?.role === 'bibliothecaire'
                 ? undefined
@@ -272,8 +422,6 @@ export default function App() {
                   }
             }
             onGoToCart={() => navigate('cart')}
-            onGoToLoans={() => navigate('loans')}
-            onGoToReservations={() => navigate('reservations')}
           />
         )}
 
@@ -282,6 +430,7 @@ export default function App() {
             user={user}
             eligibility={eligibility}
             items={cartItems}
+            borrowingDurationDays={settings?.borrowingDurationDays}
             onRequireAuth={() => navigate('auth')}
             onOpenBook={openBook}
             onBrowseCatalogue={() => navigate('catalogue')}
@@ -296,6 +445,7 @@ export default function App() {
         {page === 'loans' && (
           <LoansPage
             user={user}
+            simulatedNow={simulatedNow}
             onRequireAuth={() => navigate('auth')}
             onOpenBook={openBook}
             onBrowseCatalogue={() => navigate('catalogue')}
@@ -329,6 +479,7 @@ export default function App() {
         {page === 'admin' && (
           <LibrarianDashboard
             user={user}
+            isDemoSession={isDemoSession}
             onDataMutated={async () => {
               await Promise.all([refreshHomeBooks(), refreshSessionAndNotifications()]);
             }}
@@ -339,10 +490,28 @@ export default function App() {
           <AuthView
             googleAuth={googleAuth}
             demoModeEnabled={demoModeEnabled}
-            onAuthenticated={handleAuthenticated}
+            demoProfiles={demoState?.profiles}
+            onAuthenticated={async () => {
+              await handleAuthenticated();
+            }}
+            onOpenDemoOutbox={() => {
+              void refreshDemoState(true);
+              setDemoPanelOpen(true);
+            }}
           />
         )}
       </main>
+
+      <DemoPanel
+        open={demoPanelOpen}
+        demoState={demoState}
+        currentUser={user}
+        onClose={() => setDemoPanelOpen(false)}
+        onSwitchProfile={handleSwitchDemoProfile}
+        onResetDemo={handleResetDemo}
+        onAdvanceClock={handleAdvanceClock}
+        onRefreshState={() => refreshDemoState(true)}
+      />
 
       <footer className="border-t border-stone-200 bg-stone-50/60">
         <div className="mx-auto flex max-w-7xl flex-col gap-2 px-4 py-6 text-xs text-stone-600 sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
@@ -350,7 +519,8 @@ export default function App() {
             BiblioEST · École Supérieure de Technologie de Fès — Université Sidi Mohamed Ben Abdellah
           </p>
           <p>
-            Règlement : prêt de 7 jours · réservation chronologique FIFO · délai de retrait 3 jours
+            Règlement : prêt de {settings?.borrowingDurationDays ?? 7} jours · réservation chronologique FIFO · délai de retrait{' '}
+            {settings?.pickupWindowDays ?? 3} jours
           </p>
         </div>
       </footer>

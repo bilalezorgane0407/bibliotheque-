@@ -20,17 +20,23 @@ interface ReservationsPageProps {
 
 function getStatusMeta(status: ReservationStatus) {
   switch (status) {
+    case 'Retenu 24h':
+      return {
+        icon: BookmarkCheck,
+        color: 'text-sky-900',
+        label: 'Retenu 24 h — À retirer au comptoir',
+      };
     case 'Disponible pour retrait':
       return {
         icon: BookmarkCheck,
         color: 'text-emerald-900',
-        label: 'Disponible pour retrait',
+        label: 'FIFO prêt — À retirer sous 3 jours',
       };
     case 'En attente':
       return {
         icon: Clock,
         color: 'text-amber-800',
-        label: 'En attente',
+        label: 'En attente (file FIFO)',
       };
     case 'Exemplaire attribué':
       return {
@@ -42,7 +48,7 @@ function getStatusMeta(status: ReservationStatus) {
       return {
         icon: CheckCircle2,
         color: 'text-stone-700',
-        label: 'Retirée',
+        label: 'Retirée (emprunt remis)',
       };
     case 'Annulée':
       return {
@@ -86,7 +92,7 @@ export function ReservationsPage({
       setError(
         err instanceof ApiError
           ? err.message
-          : 'Impossible de charger vos réservations.'
+          : 'Impossible de charger vos demandes et réservations.'
       );
     } finally {
       setLoading(false);
@@ -98,14 +104,16 @@ export function ReservationsPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
-  const handleCancel = async (id: string) => {
+  const handleCancel = async (id: string, is24hHold: boolean) => {
     setBusyId(id);
     setActionMsg(null);
     setError(null);
     try {
       await api.cancelReservation(id);
       setActionMsg(
-        'Votre réservation a été annulée et la file d’attente a été recalculée.'
+        is24hHold
+          ? 'Votre retenue de 24 h a été annulée et l’exemplaire a été libéré.'
+          : 'Votre réservation a été annulée et la file d’attente a été recalculée.'
       );
       await Promise.all([loadReservations(), onUpdated()]);
     } catch (err) {
@@ -124,7 +132,7 @@ export function ReservationsPage({
           Authentification requise
         </h1>
         <p className="mt-2 text-sm text-stone-600">
-          Connectez-vous pour consulter votre file d’attente et vos exemplaires disponibles au retrait.
+          Connectez-vous pour consulter vos retenues de 24 h et votre file d’attente FIFO.
         </p>
         <button
           type="button"
@@ -141,13 +149,13 @@ export function ReservationsPage({
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
       <div className="border-b border-stone-200 pb-5">
         <p className="text-xs font-semibold text-emerald-900">
-          File chronologique FIFO · Délai de retrait 3 jours
+          Retenues 24 h au comptoir · File chronologique FIFO (retrait 3 jours)
         </p>
         <h1 className="mt-1 font-editorial text-2xl sm:text-3xl font-semibold text-stone-950">
-          Mes réservations
+          Mes retenues & réservations
         </h1>
         <p className="mt-1.5 text-sm text-stone-600">
-          Les demandes suivent strictement l’ordre chronologique. Après attribution, vous disposez de 3 jours pour le retrait à la banque d’accueil.
+          Présentez votre carte membre au comptoir pour valider le retrait de vos retenues (24 h) ou réservations FIFO prêtes (3 jours). Le prêt de 7 jours démarre lors du scan au comptoir.
         </p>
       </div>
 
@@ -180,10 +188,10 @@ export function ReservationsPage({
         <div className="mt-6 rounded-xl border border-stone-200 bg-white p-8 sm:p-12 text-center">
           <BookmarkCheck className="mx-auto h-10 w-10 text-stone-400" />
           <h2 className="mt-3 font-editorial text-xl font-semibold text-stone-900">
-            Aucune réservation enregistrée
+            Aucune retenue ni réservation enregistrée
           </h2>
           <p className="mt-1 text-sm text-stone-600">
-            Si tous les exemplaires d’un ouvrage sont empruntés, vous pouvez le réserver depuis sa fiche détaillée.
+            Ajoutez un ouvrage à votre panier puis cliquez sur « Confirmer mes demandes » pour obtenir une retenue de 24 h ou rejoindre la file FIFO.
           </p>
           <button
             type="button"
@@ -198,15 +206,17 @@ export function ReservationsPage({
           {reservations.map((res) => {
             const meta = getStatusMeta(res.status);
             const Icon = meta.icon;
+            const is24hHold = res.status === 'Retenu 24h' || res.requestType === 'retenue_24h';
             const canCancel =
-              res.status === 'En attente' || res.status === 'Disponible pour retrait';
+              res.status === 'Retenu 24h' ||
+              res.status === 'En attente' ||
+              res.status === 'Disponible pour retrait';
 
             return (
               <article
                 key={res.id}
                 className="rounded-xl border border-stone-200 bg-white p-4 sm:p-5 space-y-3"
               >
-                {/* Bandeau statut + date clé en tête de carte */}
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 pb-2.5">
                   <div className={`inline-flex items-center gap-1.5 text-xs font-semibold ${meta.color}`}>
                     <Icon className="h-4 w-4 shrink-0" />
@@ -218,11 +228,12 @@ export function ReservationsPage({
                       Position FIFO : n° {res.queuePosition}
                     </span>
                   )}
-                  {res.status === 'Disponible pour retrait' && res.pickupDeadline && (
-                    <span className="text-xs font-semibold text-emerald-900 tabular-nums">
-                      Retrait avant le {formatDateTimeFr(res.pickupDeadline)}
-                    </span>
-                  )}
+                  {(res.status === 'Retenu 24h' || res.status === 'Disponible pour retrait') &&
+                    res.pickupDeadline && (
+                      <span className="text-xs font-semibold text-emerald-900 tabular-nums">
+                        À retirer avant le {formatDateTimeFr(res.pickupDeadline)}
+                      </span>
+                    )}
                 </div>
 
                 <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -250,16 +261,20 @@ export function ReservationsPage({
 
                       <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-stone-500 tabular-nums">
                         <span>Demandée le {formatDateFr(res.requestedAt)}</span>
-                        {res.assignedCopyBarcode && (
-                          <>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-mono text-stone-700">
-                              Exemplaire {res.assignedCopyBarcode}
-                            </span>
-                          </>
-                        )}
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono">Rayon {res.shelfLocation}</span>
                       </div>
 
+                      {res.status === 'Retenu 24h' && (
+                        <p className="mt-1.5 text-xs text-sky-900 leading-relaxed">
+                          Un exemplaire physique est retenu à votre nom au comptoir. Présentez votre carte membre avant l’expiration de 24 h pour démarrer votre emprunt de 7 jours.
+                        </p>
+                      )}
+                      {res.status === 'Disponible pour retrait' && (
+                        <p className="mt-1.5 text-xs text-emerald-900 leading-relaxed">
+                          Votre tour en file FIFO est arrivé. Présentez votre carte membre au comptoir avant la limite de 3 jours pour retirer votre exemplaire.
+                        </p>
+                      )}
                       {res.status === 'En attente' && (
                         <p className="mt-1.5 text-xs text-stone-500 leading-relaxed">
                           Aucune date de disponibilité n’est garantie. Vous serez notifié dès qu’un exemplaire réutilisable sera restitué.
@@ -273,10 +288,14 @@ export function ReservationsPage({
                       <button
                         type="button"
                         disabled={busyId === res.id}
-                        onClick={() => void handleCancel(res.id)}
+                        onClick={() => void handleCancel(res.id, is24hHold)}
                         className="w-full sm:w-auto min-h-[44px] whitespace-nowrap rounded-lg border border-stone-300 bg-white px-4 py-2 text-xs font-semibold text-stone-800 hover:border-red-700 hover:text-red-800 disabled:opacity-50 cursor-pointer"
                       >
-                        {busyId === res.id ? 'Annulation…' : 'Annuler la réservation'}
+                        {busyId === res.id
+                          ? 'Annulation…'
+                          : res.status === 'Retenu 24h'
+                            ? 'Annuler la retenue 24 h'
+                            : 'Annuler la réservation'}
                       </button>
                     </div>
                   )}

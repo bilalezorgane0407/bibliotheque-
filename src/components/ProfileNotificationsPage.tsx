@@ -101,7 +101,11 @@ export function ProfileNotificationsPage({
               <div className="flex flex-col gap-0.5 py-2.5 sm:flex-row sm:justify-between sm:gap-4">
                 <dt className="text-stone-500">Rôle</dt>
                 <dd className="font-semibold text-stone-900 sm:text-right">
-                  {user.role === 'bibliothecaire' ? 'Bibliothécaire' : 'Membre (Étudiant)'}
+                  {user.role === 'bibliothecaire'
+                    ? user.isAdmin
+                      ? 'Administrateur de la bibliothèque · Bibliothécaire'
+                      : 'Bibliothécaire'
+                    : 'Membre'}
                 </dd>
               </div>
               <div className="flex flex-col gap-0.5 py-2.5 sm:flex-row sm:justify-between sm:gap-4">
@@ -125,7 +129,9 @@ export function ProfileNotificationsPage({
                     ? 'Google OIDC institutionnel'
                     : user.authSource === 'usmba_sso'
                       ? 'SSO USMBA vérifié'
-                      : 'Compte local de démonstration'}
+                      : user.isDemo
+                        ? 'Compte de démonstration (.example)'
+                        : 'Compte académique local (OTP)'}
                 </dd>
               </div>
               <div className="flex flex-col gap-0.5 py-2.5 sm:flex-row sm:justify-between sm:gap-4">
@@ -148,24 +154,41 @@ export function ProfileNotificationsPage({
                 </div>
 
                 <div className="flex items-center gap-2 text-xs">
+                  {eligibility.emailVerified ? (
+                    <CheckCircle2 className="h-4 w-4 text-emerald-800 shrink-0" />
+                  ) : (
+                    <AlertTriangle className="h-4 w-4 text-amber-700 shrink-0" />
+                  )}
+                  <span>
+                    2. Adresse académique vérifiée ({eligibility.emailVerified ? 'oui' : 'en attente'})
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2 text-xs">
                   {eligibility.verifiedEstStudent ? (
                     <CheckCircle2 className="h-4 w-4 text-emerald-800 shrink-0" />
                   ) : (
                     <AlertTriangle className="h-4 w-4 text-amber-700 shrink-0" />
                   )}
                   <span>
-                    2. Étudiant EST Fès vérifié ({user.studentStatus === 'verifie' ? 'confirmé' : 'en attente / non vérifié'})
+                    3. Statut EST Fès (
+                    {user.studentStatus === 'verifie'
+                      ? 'vérifié'
+                      : user.studentStatus === 'en_attente'
+                        ? 'en attente de validation'
+                        : user.studentStatus}
+                    )
                   </span>
                 </div>
 
                 <div className="flex items-center gap-2 text-xs">
-                  {eligibility.noOverdueLoans ? (
+                  {eligibility.accountActive && eligibility.noOverdueLoans ? (
                     <CheckCircle2 className="h-4 w-4 text-emerald-800 shrink-0" />
                   ) : (
                     <AlertTriangle className="h-4 w-4 text-red-700 shrink-0" />
                   )}
                   <span>
-                    3. Aucun retour en retard ({eligibility.overdueCount} en cours)
+                    4. Compte {user.accountStatus} · Aucun retour en retard ({eligibility.overdueCount} en cours)
                   </span>
                 </div>
 

@@ -10,21 +10,22 @@ function getSessionSecret(): string {
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16) {
     return process.env.SESSION_SECRET;
   }
-  // Fallback déterministe lié au processus si SESSION_SECRET n'est pas défini en développement
   return crypto
     .createHash('sha256')
     .update(process.cwd() + '_biblioest_dev_session_key')
     .digest('hex');
 }
 
-interface SessionPayload {
+export interface SessionPayload {
   userId: string;
+  isDemoSession?: boolean;
   exp: number;
 }
 
-export function createSessionToken(userId: string): string {
+export function createSessionToken(userId: string, isDemoSession = false): string {
   const payload: SessionPayload = {
     userId,
+    ...(isDemoSession ? { isDemoSession: true } : {}),
     exp: Date.now() + SESSION_TTL_MS,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
@@ -75,7 +76,6 @@ export function parseCookies(cookieHeader: string | undefined): Record<string, s
     try {
       value = decodeURIComponent(rawValue);
     } catch {
-      // Conserver la valeur brute si un autre cookie du domaine contient un '%' non encodé
       value = rawValue;
     }
     if (key) result[key] = value;
@@ -175,8 +175,13 @@ export function buildCookieOptions(
   };
 }
 
-export function setSessionCookie(req: Request, res: Response, userId: string): void {
-  const token = createSessionToken(userId);
+export function setSessionCookie(
+  req: Request,
+  res: Response,
+  userId: string,
+  isDemoSession = false
+): void {
+  const token = createSessionToken(userId, isDemoSession);
   res.cookie(COOKIE_NAME, token, buildCookieOptions(req, SESSION_TTL_MS));
 }
 
@@ -191,20 +196,28 @@ export function hasSessionCookie(req: Request): boolean {
 
 export interface AuthenticatedRequest extends Request {
   user?: UserPublic | null;
+  isDemoSession?: boolean;
 }
 
-export function createAuthMiddleware(db: Database.Database) {
-  const getUserStmt = db.prepare(`
-    SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
+export function createAuthMiddleware(
+  realDb: Database.Database,
+  demoDb?: Database.Database,
+  isDemoEnabled: () => boolean = () => true
+) {
+  const userSelectSql = `
+    SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
     FROM users
     WHERE id = ?
-  `);
+  `;
+  const getRealUserStmt = realDb.prepare(userSelectSql);
+  const getDemoUserStmt = (demoDb || realDb).prepare(userSelectSql);
 
   function attachUser(req: AuthenticatedRequest, _res: Response, next: NextFunction): void {
     const cookies = parseCookies(req.headers.cookie);
     const token = cookies[COOKIE_NAME];
     if (!token) {
       req.user = null;
+      req.isDemoSession = false;
       next();
       return;
     }
@@ -212,19 +225,53 @@ export function createAuthMiddleware(db: Database.Database) {
     const payload = verifySessionToken(token);
     if (!payload) {
       req.user = null;
+      req.isDemoSession = false;
       next();
       return;
     }
 
-    const row = getUserStmt.get(payload.userId) as (UserPublic & { isDemo?: number | boolean }) | undefined;
-    req.user = row ? { ...row, isDemo: Boolean(row.isDemo) } : null;
+    if (payload.isDemoSession) {
+      if (!isDemoEnabled()) {
+        req.user = null;
+        req.isDemoSession = false;
+        next();
+        return;
+      }
+      const row = getDemoUserStmt.get(payload.userId) as
+        | (UserPublic & { isDemo?: number | boolean; emailVerified?: number | boolean; isAdmin?: number | boolean })
+        | undefined;
+      req.user = row
+        ? {
+            ...row,
+            emailVerified: row.emailVerified === undefined ? true : Boolean(row.emailVerified),
+            isAdmin: Boolean(row.isAdmin),
+            isDemo: true,
+          }
+        : null;
+      req.isDemoSession = Boolean(req.user);
+      next();
+      return;
+    }
+
+    const row = getRealUserStmt.get(payload.userId) as
+      | (UserPublic & { isDemo?: number | boolean; emailVerified?: number | boolean; isAdmin?: number | boolean })
+      | undefined;
+    req.user = row
+      ? {
+          ...row,
+          emailVerified: row.emailVerified === undefined ? true : Boolean(row.emailVerified),
+          isAdmin: Boolean(row.isAdmin),
+          isDemo: Boolean(row.isDemo),
+        }
+      : null;
+    req.isDemoSession = false;
     next();
   }
 
   function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
     if (!req.user) {
       res.status(401).json({
-        error: 'Authentification requise. Veuillez vous connecter avec votre compte USMBA.',
+        error: 'Authentification requise. Veuillez vous connecter avec votre compte académique.',
         code: 'AUTH_REQUIRED',
       });
       return;
@@ -250,5 +297,23 @@ export function createAuthMiddleware(db: Database.Database) {
     next();
   }
 
-  return { attachUser, requireAuth, requireLibrarian };
+  function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+    if (!req.user) {
+      res.status(401).json({
+        error: 'Authentification requise.',
+        code: 'AUTH_REQUIRED',
+      });
+      return;
+    }
+    if (req.user.role !== 'bibliothecaire' || !req.user.isAdmin) {
+      res.status(403).json({
+        error: 'Accès refusé. Cette action est réservée à l’administrateur de la bibliothèque.',
+        code: 'FORBIDDEN_ADMIN',
+      });
+      return;
+    }
+    next();
+  }
+
+  return { attachUser, requireAuth, requireLibrarian, requireAdmin };
 }

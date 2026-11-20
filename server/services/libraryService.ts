@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import type Database from 'better-sqlite3';
+import { hashPassword } from '../auth/password.ts';
 import {
   BORROWING_DURATION_DAYS,
+  HOLD_DURATION_HOURS,
   MAX_QUANTITY_PER_TITLE,
   PICKUP_WINDOW_DAYS,
+  type AccountStatus,
   type AuditLogRecord,
   type Book,
   type BookDetail,
@@ -12,17 +15,25 @@ import {
   type CartConfirmationResponse,
   type CartItemRecord,
   type Copy,
+  type CopyStateLogRecord,
   type CopyStatus,
+  type CounterMemberDossier,
+  type CounterPickupResult,
+  type CounterReturnLookup,
   type DashboardStats,
   type EligibilityReport,
+  type LibrarySettings,
   type LoanRecord,
   type NotificationRecord,
+  type OverdueEmailRecipient,
   type PhysicalCondition,
+  type RequestType,
   type ReservationRecord,
   type ReturnInspectionOutcome,
+  type SimulatedEmailRecord,
   type StudentStatus,
-  type AccountStatus,
   type UserPublic,
+  type UserRole,
 } from '../../shared/types.ts';
 
 type AuditActor = {
@@ -56,15 +67,150 @@ function addDaysIso(date: Date, days: number): string {
   return new Date(date.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
 }
 
+function addHoursIso(date: Date, hours: number): string {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000).toISOString();
+}
+
 export class LibraryService {
   private readonly db: Database.Database;
+  private readonly isDemoSandbox: boolean;
 
-  constructor(db: Database.Database) {
+  constructor(db: Database.Database, options?: { isDemoSandbox?: boolean }) {
     this.db = db;
+    this.isDemoSandbox = Boolean(options?.isDemoSandbox);
   }
 
   private generateId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID().slice(0, 12)}`;
+  }
+
+  public getSettings(): LibrarySettings {
+    const row = this.db
+      .prepare(`SELECT * FROM library_settings WHERE id = 'default'`)
+      .get() as
+      | {
+          borrowingDurationDays: number;
+          pickupWindowDays: number;
+          maxQuantityPerTitle: number;
+          realEmailsEnabled: number;
+          testEmailRecipient: string;
+        }
+      | undefined;
+
+    if (!row) {
+      return {
+        borrowingDurationDays: BORROWING_DURATION_DAYS,
+        pickupWindowDays: PICKUP_WINDOW_DAYS,
+        maxQuantityPerTitle: MAX_QUANTITY_PER_TITLE,
+        realEmailsEnabled: this.isDemoSandbox ? false : true,
+        testEmailRecipient: this.isDemoSandbox
+          ? 'test.demo@usmba.example'
+          : 'bilale.zorgane@usmba.ac.ma',
+      };
+    }
+
+    return {
+      borrowingDurationDays: Number(row.borrowingDurationDays) || BORROWING_DURATION_DAYS,
+      pickupWindowDays: Number(row.pickupWindowDays) || PICKUP_WINDOW_DAYS,
+      maxQuantityPerTitle: Number(row.maxQuantityPerTitle) || MAX_QUANTITY_PER_TITLE,
+      realEmailsEnabled: this.isDemoSandbox ? false : Boolean(row.realEmailsEnabled),
+      testEmailRecipient: String(row.testEmailRecipient || 'bilale.zorgane@usmba.ac.ma'),
+    };
+  }
+
+  public updateSettings(
+    patch: Partial<LibrarySettings>,
+    actor: AuditActor,
+    now: Date = new Date()
+  ): LibrarySettings {
+    const current = this.getSettings();
+    const borrowingDurationDays =
+      patch.borrowingDurationDays !== undefined
+        ? Math.max(1, Math.min(60, Math.floor(Number(patch.borrowingDurationDays))))
+        : current.borrowingDurationDays;
+    const pickupWindowDays =
+      patch.pickupWindowDays !== undefined
+        ? Math.max(1, Math.min(14, Math.floor(Number(patch.pickupWindowDays))))
+        : current.pickupWindowDays;
+    const maxQuantityPerTitle =
+      patch.maxQuantityPerTitle !== undefined
+        ? Math.max(1, Math.min(5, Math.floor(Number(patch.maxQuantityPerTitle))))
+        : current.maxQuantityPerTitle;
+    const realEmailsEnabled =
+      this.isDemoSandbox
+        ? false
+        : patch.realEmailsEnabled !== undefined
+          ? Boolean(patch.realEmailsEnabled)
+          : current.realEmailsEnabled;
+    const testEmailRecipient =
+      patch.testEmailRecipient !== undefined && patch.testEmailRecipient.trim()
+        ? patch.testEmailRecipient.trim().toLowerCase()
+        : current.testEmailRecipient;
+
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO library_settings (id, borrowingDurationDays, pickupWindowDays, maxQuantityPerTitle, realEmailsEnabled, testEmailRecipient)
+         VALUES ('default', ?, ?, ?, ?, ?)`
+      )
+      .run(
+        borrowingDurationDays,
+        pickupWindowDays,
+        maxQuantityPerTitle,
+        realEmailsEnabled ? 1 : 0,
+        testEmailRecipient
+      );
+
+    this.insertAuditLogInternal(
+      actor,
+      'LIBRARY_SETTINGS_UPDATED',
+      'settings',
+      'default',
+      `Paramètres mis à jour : prêt=${borrowingDurationDays}j, retrait=${pickupWindowDays}j, e-mails réels=${realEmailsEnabled ? 'activés' : 'désactivés'}, destinataire test=${testEmailRecipient}.`,
+      now
+    );
+
+    return this.getSettings();
+  }
+
+  public recordSimulatedEmail(
+    params: {
+      recipientEmail: string;
+      subject: string;
+      body: string;
+      category: SimulatedEmailRecord['category'];
+    },
+    now: Date = new Date()
+  ): SimulatedEmailRecord {
+    const id = this.generateId('sim');
+    const createdAt = now.toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO simulated_outbox (id, recipientEmail, subject, body, category, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, params.recipientEmail, params.subject, params.body, params.category, createdAt);
+    return { id, ...params, createdAt };
+  }
+
+  public getSimulatedOutbox(limit = 50): SimulatedEmailRecord[] {
+    const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+    const rows = this.db
+      .prepare(
+        `SELECT id, recipientEmail, subject, body, category, createdAt
+         FROM simulated_outbox
+         ORDER BY createdAt DESC, rowid DESC
+         LIMIT ?`
+      )
+      .all(safeLimit) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => ({
+      id: String(r.id),
+      recipientEmail: String(r.recipientEmail),
+      subject: String(r.subject),
+      body: String(r.body),
+      category: r.category as SimulatedEmailRecord['category'],
+      createdAt: String(r.createdAt),
+    }));
   }
 
   private syncOverdueLoansInternal(now: Date): void {
@@ -128,6 +274,61 @@ export class LibraryService {
     this.insertAuditLogInternal(actor, action, entityType, entityId, summary, now);
   }
 
+  private insertCopyStateLogInternal(
+    params: {
+      copyId: string;
+      copyBarcode: string;
+      bookId: string;
+      bookTitle: string;
+      oldStatus: CopyStatus | null;
+      newStatus: CopyStatus;
+      memberId?: string | null;
+      memberName?: string | null;
+      agent?: AuditActor | null;
+      requestOrLoanId?: string | null;
+      summary: string;
+    },
+    now: Date
+  ): void {
+    let resolvedMemberName = params.memberName ?? null;
+    if (params.memberId && !resolvedMemberName) {
+      const mRow = this.db
+        .prepare(`SELECT fullName FROM users WHERE id = ?`)
+        .get(params.memberId) as { fullName: string } | undefined;
+      resolvedMemberName = mRow?.fullName || null;
+    }
+
+    let resolvedAgentName = params.agent?.fullName ?? null;
+    if (params.agent?.id && !resolvedAgentName) {
+      const aRow = this.db
+        .prepare(`SELECT fullName FROM users WHERE id = ?`)
+        .get(params.agent.id) as { fullName: string } | undefined;
+      resolvedAgentName = aRow?.fullName || null;
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO copy_state_logs (id, copyId, copyBarcode, bookId, bookTitle, oldStatus, newStatus, memberId, memberName, agentId, agentName, requestOrLoanId, summary, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.generateId('csl'),
+        params.copyId,
+        params.copyBarcode,
+        params.bookId,
+        params.bookTitle,
+        params.oldStatus,
+        params.newStatus,
+        params.memberId || null,
+        resolvedMemberName,
+        params.agent?.id || null,
+        resolvedAgentName,
+        params.requestOrLoanId || null,
+        params.summary,
+        now.toISOString()
+      );
+  }
+
   private recalculateQueuePositionsInternal(bookId: string): void {
     const pending = this.db
       .prepare(
@@ -147,13 +348,14 @@ export class LibraryService {
     if (!memberId) {
       return {
         authenticated: false,
+        emailVerified: false,
         verifiedEstStudent: false,
         accountActive: false,
         noOverdueLoans: false,
         eligible: false,
         overdueCount: 0,
         reasonCode: 'AUTH_REQUIRED',
-        reasonMessage: 'Authentification requise. Veuillez vous connecter avec votre compte USMBA.',
+        reasonMessage: 'Authentification requise. Veuillez vous connecter avec votre compte académique.',
       };
     }
 
@@ -161,15 +363,22 @@ export class LibraryService {
 
     const user = this.db
       .prepare(
-        `SELECT id, institution, studentStatus, accountStatus FROM users WHERE id = ?`
+        `SELECT id, institution, studentStatus, accountStatus, emailVerified FROM users WHERE id = ?`
       )
       .get(memberId) as
-      | { id: string; institution: string; studentStatus: StudentStatus; accountStatus: AccountStatus }
+      | {
+          id: string;
+          institution: string;
+          studentStatus: StudentStatus;
+          accountStatus: AccountStatus;
+          emailVerified?: number;
+        }
       | undefined;
 
     if (!user) {
       return {
         authenticated: false,
+        emailVerified: false,
         verifiedEstStudent: false,
         accountActive: false,
         noOverdueLoans: false,
@@ -180,11 +389,30 @@ export class LibraryService {
       };
     }
 
+    const emailVerified = user.emailVerified === undefined ? true : Boolean(user.emailVerified);
+    const verifiedEstStudent = user.studentStatus === 'verifie';
     const accountActive = user.accountStatus === 'actif';
+
+    if (!emailVerified) {
+      return {
+        authenticated: true,
+        emailVerified: false,
+        verifiedEstStudent,
+        accountActive,
+        noOverdueLoans: true,
+        eligible: false,
+        overdueCount: 0,
+        reasonCode: 'EMAIL_NOT_VERIFIED',
+        reasonMessage:
+          'Votre adresse e-mail académique n’est pas encore vérifiée. Veuillez saisir le code à usage unique envoyé par e-mail.',
+      };
+    }
+
     if (!accountActive) {
       return {
         authenticated: true,
-        verifiedEstStudent: user.institution === 'EST Fès' && user.studentStatus === 'verifie',
+        emailVerified: true,
+        verifiedEstStudent,
         accountActive: false,
         noOverdueLoans: false,
         eligible: false,
@@ -194,10 +422,10 @@ export class LibraryService {
       };
     }
 
-    const verifiedEstStudent = user.institution === 'EST Fès' && user.studentStatus === 'verifie';
     if (!verifiedEstStudent) {
       return {
         authenticated: true,
+        emailVerified: true,
         verifiedEstStudent: false,
         accountActive: true,
         noOverdueLoans: true,
@@ -205,7 +433,7 @@ export class LibraryService {
         overdueCount: 0,
         reasonCode: 'EST_STATUS_NOT_VERIFIED',
         reasonMessage:
-          'Statut d’étudiant EST Fès non vérifié. Votre inscription auprès de l’EST Fès doit être confirmée avant d’emprunter ou de réserver.',
+          'Adresse académique vérifiée, mais votre statut EST Fès est en attente de validation par le personnel de la bibliothèque.',
       };
     }
 
@@ -221,6 +449,7 @@ export class LibraryService {
     if (overdueCount > 0) {
       return {
         authenticated: true,
+        emailVerified: true,
         verifiedEstStudent: true,
         accountActive: true,
         noOverdueLoans: false,
@@ -233,13 +462,14 @@ export class LibraryService {
 
     return {
       authenticated: true,
+      emailVerified: true,
       verifiedEstStudent: true,
       accountActive: true,
       noOverdueLoans: true,
       eligible: true,
       overdueCount: 0,
       reasonCode: 'ELIGIBLE',
-      reasonMessage: 'Membre éligible aux emprunts et réservations.',
+      reasonMessage: 'Membre vérifié et éligible aux emprunts et réservations.',
     };
   }
 
@@ -258,17 +488,20 @@ export class LibraryService {
     bookId: string,
     copyId: string,
     now: Date,
-    actor?: AuditActor | null
+    actor?: AuditActor | null,
+    previousCopyStatus: CopyStatus | null = null
   ): string | null {
     const book = this.db
-      .prepare(`SELECT title FROM books WHERE id = ?`)
-      .get(bookId) as { title: string } | undefined;
+      .prepare(`SELECT title, shelfLocation FROM books WHERE id = ?`)
+      .get(bookId) as { title: string; shelfLocation: string } | undefined;
     const copy = this.db
-      .prepare(`SELECT barcode FROM copies WHERE id = ?`)
-      .get(copyId) as { barcode: string } | undefined;
+      .prepare(`SELECT barcode, status FROM copies WHERE id = ?`)
+      .get(copyId) as { barcode: string; status: CopyStatus } | undefined;
 
     if (!book || !copy) return null;
 
+    const oldStatus = previousCopyStatus ?? copy.status;
+    const settings = this.getSettings();
     const pendingList = this.db
       .prepare(
         `SELECT id, memberId, requestedAt FROM reservations
@@ -283,44 +516,82 @@ export class LibraryService {
         continue;
       }
 
+      const nowIso = now.toISOString();
+      const pickupDeadline = addDaysIso(now, settings.pickupWindowDays);
+
       this.db
         .prepare(
           `UPDATE copies
-           SET status = 'Réservé', location = 'Banque d’accueil · En attente de confirmation'
+           SET status = 'Réservé', location = 'Banque d’accueil · Retrait réservations (3j)'
            WHERE id = ?`
         )
         .run(copyId);
 
-      // Règle 7 & 8 : l'exemplaire est proposé au premier membre éligible,
-      // mais le délai de retrait de 3 jours ne démarre qu'après confirmation par le bibliothécaire.
+      // Diagramme 2 & 3 : l'exemplaire réutilisable est immédiatement attribué au premier de la file FIFO
+      // et conservé pendant le délai de retrait (3 jours par défaut) sans exposer le code-barres au public.
       this.db
         .prepare(
           `UPDATE reservations
-           SET status = 'Exemplaire attribué',
+           SET status = 'Disponible pour retrait',
                assignedCopyId = ?,
-               availableAt = NULL,
-               pickupDeadline = NULL,
+               availableAt = ?,
+               pickupDeadline = ?,
                queuePosition = NULL
            WHERE id = ?`
         )
-        .run(copyId, candidate.id);
+        .run(copyId, nowIso, pickupDeadline, candidate.id);
 
       this.recalculateQueuePositionsInternal(bookId);
 
+      const notifMessage = `Votre réservation pour « ${book.title} » est désormais prête à la banque d’accueil. Présentez votre carte membre pour le retrait dans un délai de ${settings.pickupWindowDays} jours, jusqu’au ${formatFrenchDateTime(pickupDeadline)}.`;
+
       this.insertNotificationInternal(
         candidate.memberId,
-        'Exemplaire attribué — confirmation bibliothèque en attente',
-        `Un exemplaire de « ${book.title} » (${copy.barcode}) vous a été attribué selon l’ordre FIFO. Le délai de retrait de 3 jours commencera dès que le bibliothécaire aura confirmé sa mise à disposition.`,
-        'reservation',
+        'Ouvrage disponible pour retrait',
+        notifMessage,
+        'retrait',
+        now
+      );
+
+      if (this.isDemoSandbox) {
+        const memberRow = this.db
+          .prepare(`SELECT email FROM users WHERE id = ?`)
+          .get(candidate.memberId) as { email: string } | undefined;
+        if (memberRow?.email) {
+          this.recordSimulatedEmail(
+            {
+              recipientEmail: memberRow.email,
+              subject: `BiblioEST — « ${book.title} » disponible pour retrait (${settings.pickupWindowDays} j)`,
+              body: notifMessage,
+              category: 'retrait',
+            },
+            now
+          );
+        }
+      }
+
+      this.insertCopyStateLogInternal(
+        {
+          copyId,
+          copyBarcode: copy.barcode,
+          bookId,
+          bookTitle: book.title,
+          oldStatus,
+          newStatus: 'Réservé',
+          memberId: candidate.memberId,
+          agent: actor || { id: 'system', fullName: 'Système file FIFO', role: 'system' },
+          requestOrLoanId: candidate.id,
+          summary: `Exemplaire ${copy.barcode} attribué au premier membre FIFO éligible (délai de retrait ${settings.pickupWindowDays} j).`,
+        },
         now
       );
 
       this.insertAuditLogInternal(
         actor,
-        'RESERVATION_PROPOSED',
+        'RESERVATION_ASSIGNED_FOR_PICKUP',
         'reservation',
         candidate.id,
-        `Exemplaire ${copy.barcode} (« ${book.title} ») attribué en priorité FIFO à la réservation ${candidate.id} (confirmation de mise à disposition requise).`,
+        `Exemplaire ${copy.barcode} (« ${book.title} ») attribué automatiquement en priorité FIFO et mis à disposition pour retrait (${settings.pickupWindowDays} jours jusqu’au ${formatFrenchDateTime(pickupDeadline)}).`,
         now
       );
 
@@ -328,13 +599,25 @@ export class LibraryService {
     }
 
     // Aucun membre en attente éligible : remettre l'exemplaire en rayon
-    const bookShelf = this.db
-      .prepare(`SELECT shelfLocation FROM books WHERE id = ?`)
-      .get(bookId) as { shelfLocation: string } | undefined;
-
     this.db
       .prepare(`UPDATE copies SET status = 'Disponible', location = ? WHERE id = ?`)
-      .run(bookShelf ? `Rayon · ${bookShelf.shelfLocation}` : 'Rayon principal', copyId);
+      .run(book.shelfLocation ? `Rayon · ${book.shelfLocation}` : 'Rayon principal', copyId);
+
+    if (oldStatus !== 'Disponible') {
+      this.insertCopyStateLogInternal(
+        {
+          copyId,
+          copyBarcode: copy.barcode,
+          bookId,
+          bookTitle: book.title,
+          oldStatus,
+          newStatus: 'Disponible',
+          agent: actor || { id: 'system', fullName: 'Système circulation', role: 'system' },
+          summary: `Exemplaire ${copy.barcode} remis en rayon (Disponible, aucune attente FIFO éligible).`,
+        },
+        now
+      );
+    }
 
     return null;
   }
@@ -343,21 +626,24 @@ export class LibraryService {
     const nowIso = now.toISOString();
     const expired = this.db
       .prepare(
-        `SELECT r.id, r.memberId, r.bookId, r.assignedCopyId, b.title as bookTitle
+        `SELECT r.id, r.memberId, r.bookId, r.status, r.requestType, r.assignedCopyId, b.title as bookTitle
          FROM reservations r
          JOIN books b ON b.id = r.bookId
-         WHERE r.status = 'Disponible pour retrait' AND r.pickupDeadline < ?
+         WHERE r.status IN ('Retenu 24h', 'Disponible pour retrait') AND r.pickupDeadline < ?
          ORDER BY r.pickupDeadline ASC`
       )
       .all(nowIso) as Array<{
       id: string;
       memberId: string;
       bookId: string;
+      status: string;
+      requestType: RequestType;
       assignedCopyId: string | null;
       bookTitle: string;
     }>;
 
     for (const res of expired) {
+      const is24hHold = res.status === 'Retenu 24h';
       this.db
         .prepare(
           `UPDATE reservations
@@ -368,27 +654,37 @@ export class LibraryService {
 
       this.insertNotificationInternal(
         res.memberId,
-        'Réservation expirée',
-        `Le délai de retrait de 3 jours pour « ${res.bookTitle} » est dépassé. Votre réservation a expiré et l’exemplaire a été libéré.`,
+        is24hHold ? 'Retenue 24 h expirée' : 'Réservation expirée',
+        is24hHold
+          ? `Le délai de retrait de 24 h pour « ${res.bookTitle} » est dépassé. La retenue a expiré et l’exemplaire a été libéré.`
+          : `Le délai de retrait de 3 jours pour « ${res.bookTitle} » est dépassé. Votre réservation a expiré et l’exemplaire a été libéré.`,
         'expiration',
         now
       );
 
       this.insertAuditLogInternal(
         { id: 'system', fullName: 'Système échéances', role: 'system' },
-        'RESERVATION_EXPIRED',
+        is24hHold ? 'RESERVATION_HOLD_24H_EXPIRED' : 'RESERVATION_EXPIRED',
         'reservation',
         res.id,
-        `Délai de retrait de 3 jours expiré pour « ${res.bookTitle} » (réservation ${res.id}).`,
+        is24hHold
+          ? `Retenue 24 h expirée pour « ${res.bookTitle} » (${res.id}).`
+          : `Délai de retrait de 3 jours expiré pour « ${res.bookTitle} » (réservation ${res.id}).`,
         now
       );
 
       if (res.assignedCopyId) {
-        this.assignCopyToNextEligibleReservationInternal(res.bookId, res.assignedCopyId, now);
+        this.assignCopyToNextEligibleReservationInternal(
+          res.bookId,
+          res.assignedCopyId,
+          now,
+          { id: 'system', fullName: 'Système échéances', role: 'system' },
+          is24hHold ? 'Retenu 24h' : 'Réservé'
+        );
       }
     }
 
-    // Notifications d'échéance proche (< 24 heures)
+    // Notifications d'échéance proche (< 24 heures) pour les réservations FIFO prêtes (3 jours)
     const soonIso = addDaysIso(now, 1);
     const approaching = this.db
       .prepare(
@@ -450,11 +746,12 @@ export class LibraryService {
         `SELECT b.*,
           COALESCE(SUM(CASE WHEN c.status != 'Retiré définitivement' THEN 1 ELSE 0 END), 0) as totalCopies,
           COALESCE(SUM(CASE WHEN c.status = 'Disponible' AND c.needsInspection = 0 THEN 1 ELSE 0 END), 0) as availableCopies,
+          COALESCE(SUM(CASE WHEN c.status = 'Retenu 24h' THEN 1 ELSE 0 END), 0) as held24hCopies,
           COALESCE(SUM(CASE WHEN c.status = 'Emprunté' THEN 1 ELSE 0 END), 0) as borrowedCopies,
           COALESCE(SUM(CASE WHEN c.status = 'Réservé' THEN 1 ELSE 0 END), 0) as reservedCopies,
           COALESCE(SUM(CASE WHEN c.status = 'En réparation' THEN 1 ELSE 0 END), 0) as repairCopies,
           COALESCE(SUM(CASE WHEN c.status = 'Retiré définitivement' THEN 1 ELSE 0 END), 0) as withdrawnCopies,
-          COALESCE(SUM(CASE WHEN c.status IN ('Disponible', 'Emprunté', 'Réservé', 'En réparation') THEN 1 ELSE 0 END), 0) as circulatingCopies
+          COALESCE(SUM(CASE WHEN c.status IN ('Disponible', 'Retenu 24h', 'Emprunté', 'Réservé', 'En réparation') THEN 1 ELSE 0 END), 0) as circulatingCopies
          FROM books b
          LEFT JOIN copies c ON c.bookId = b.id
          WHERE (? = 1 OR b.archived = 0)
@@ -482,6 +779,7 @@ export class LibraryService {
       createdAt: String(r.createdAt),
       totalCopies: Number(r.totalCopies),
       availableCopies: Number(r.availableCopies),
+      held24hCopies: Number(r.held24hCopies),
       borrowedCopies: Number(r.borrowedCopies),
       reservedCopies: Number(r.reservedCopies),
       repairCopies: Number(r.repairCopies),
@@ -520,7 +818,11 @@ export class LibraryService {
     return books;
   }
 
-  public getBookDetail(bookId: string, now: Date = new Date()): BookDetail {
+  public getBookDetail(
+    bookId: string,
+    now: Date = new Date(),
+    options?: { includeCopies?: boolean }
+  ): BookDetail {
     this.processDeadlines(now);
 
     const bookRow = this.db
@@ -553,6 +855,7 @@ export class LibraryService {
         c.physicalCondition !== 'Endommagé' &&
         c.physicalCondition !== 'Hors service'
     ).length;
+    const held24hCopies = copies.filter((c) => c.status === 'Retenu 24h').length;
     const borrowedCopies = copies.filter((c) => c.status === 'Emprunté').length;
     const reservedCopies = copies.filter((c) => c.status === 'Réservé').length;
     const repairCopies = copies.filter((c) => c.status === 'En réparation').length;
@@ -567,13 +870,15 @@ export class LibraryService {
     let reservationBlockedReason: string | null = null;
     if (Boolean(bookRow.archived)) {
       reservationBlockedReason = 'Cet ouvrage est archivé et ne peut plus être emprunté ni réservé.';
-    } else if (availableCopies > 0) {
+    } else if (availableCopies > 0 && pendingRow.cnt === 0) {
       reservationBlockedReason =
-        'Au moins un exemplaire est disponible en rayon pour un emprunt immédiat.';
+        'Un exemplaire est disponible : la validation du panier créera une retenue de 24 h au comptoir.';
     } else if (circulatingCopies === 0) {
       reservationBlockedReason =
         'Aucun exemplaire en circulation : tous les exemplaires ont été retirés définitivement ou sont indisponibles de façon permanente.';
     }
+
+    const includeCopies = options?.includeCopies !== false;
 
     return {
       id: String(bookRow.id),
@@ -594,15 +899,16 @@ export class LibraryService {
       createdAt: String(bookRow.createdAt),
       totalCopies,
       availableCopies,
+      held24hCopies,
       borrowedCopies,
       reservedCopies,
       repairCopies,
       withdrawnCopies,
       circulatingCopies,
-      copies,
+      copies: includeCopies ? copies : [],
       pendingReservationsCount: pendingRow.cnt,
-      canBorrow: !Boolean(bookRow.archived) && availableCopies > 0,
-      canReserve: !Boolean(bookRow.archived) && availableCopies === 0 && circulatingCopies > 0,
+      canBorrow: !Boolean(bookRow.archived) && availableCopies > 0 && pendingRow.cnt === 0,
+      canReserve: !Boolean(bookRow.archived) && (availableCopies === 0 || pendingRow.cnt > 0) && circulatingCopies > 0,
       reservationBlockedReason,
     };
   }
@@ -686,9 +992,10 @@ export class LibraryService {
       );
     }
 
+    const settings = this.getSettings();
     const loanId = this.generateId('ln');
     const borrowedAt = now.toISOString();
-    const dueAt = addDaysIso(now, BORROWING_DURATION_DAYS);
+    const dueAt = addDaysIso(now, settings.borrowingDurationDays);
 
     this.db
       .prepare(
@@ -697,10 +1004,26 @@ export class LibraryService {
       )
       .run(loanId, memberId, String(availableCopy.id), bookId, borrowedAt, dueAt);
 
+    this.insertCopyStateLogInternal(
+      {
+        copyId: String(availableCopy.id),
+        copyBarcode: String(availableCopy.barcode),
+        bookId,
+        bookTitle: String(book.title),
+        oldStatus: 'Disponible',
+        newStatus: 'Emprunté',
+        memberId,
+        agent: actor || { id: memberId, role: 'membre' },
+        requestOrLoanId: loanId,
+        summary: `Prêt direct enregistré pour « ${String(book.title)} » (${String(availableCopy.barcode)}).`,
+      },
+      now
+    );
+
     this.insertNotificationInternal(
       memberId,
       'Emprunt confirmé',
-      `Votre emprunt pour « ${String(book.title)} » (exemplaire ${String(availableCopy.barcode)}) est confirmé. Date limite de retour : ${formatFrenchDateTime(dueAt)} (7 jours).`,
+      `Votre emprunt pour « ${String(book.title)} » (exemplaire ${String(availableCopy.barcode)}) est confirmé. Date limite de retour : ${formatFrenchDateTime(dueAt)} (${settings.borrowingDurationDays} jours).`,
       'emprunt',
       now
     );
@@ -746,7 +1069,8 @@ export class LibraryService {
     memberId: string,
     bookId: string,
     now: Date,
-    actor?: AuditActor | null
+    actor?: AuditActor | null,
+    options?: { hideBarcode?: boolean }
   ): ReservationRecord {
     this.assertEligibleInternal(memberId, now);
 
@@ -780,13 +1104,15 @@ export class LibraryService {
 
     const existingRes = this.db
       .prepare(
-        `SELECT id FROM reservations
-         WHERE memberId = ? AND bookId = ? AND status IN ('En attente', 'Exemplaire attribué', 'Disponible pour retrait')`
+        `SELECT id, status FROM reservations
+         WHERE memberId = ? AND bookId = ? AND status IN ('En attente', 'Retenu 24h', 'Exemplaire attribué', 'Disponible pour retrait')`
       )
-      .get(memberId, bookId);
+      .get(memberId, bookId) as { id: string; status: string } | undefined;
     if (existingRes) {
       throw new DomainError(
-        'Vous avez déjà une réservation active pour cet ouvrage.',
+        existingRes.status === 'Retenu 24h'
+          ? 'Vous avez déjà une retenue de 24 h active pour cet ouvrage.'
+          : 'Vous avez déjà une réservation active pour cet ouvrage.',
         409,
         'DUPLICATE_RESERVATION'
       );
@@ -804,21 +1130,23 @@ export class LibraryService {
         c.physicalCondition !== 'Hors service'
     );
 
-    if (hasAvailable) {
+    const pendingQueueRow = this.db
+      .prepare(`SELECT COUNT(*) as cnt FROM reservations WHERE bookId = ? AND status = 'En attente'`)
+      .get(bookId) as { cnt: number };
+
+    if (hasAvailable && pendingQueueRow.cnt === 0) {
       throw new DomainError(
-        'Un exemplaire est actuellement disponible : veuillez emprunter l’ouvrage directement.',
+        'Un exemplaire est disponible et aucune file FIFO n’est prioritaire : passez par le panier pour créer une retenue 24 h.',
         409,
         'COPY_AVAILABLE_NO_RESERVATION'
       );
     }
 
-    const hasCirculating = copies.some(
-      (c) => c.status !== 'Retiré définitivement'
-    );
+    const hasCirculating = copies.some((c) => c.status !== 'Retiré définitivement');
 
     if (!hasCirculating) {
       throw new DomainError(
-        'Réservation refusée : tous les exemplaires de cet ouvrage ont été retirés définitivement et ne peuvent plus retourner en circulation.',
+        'Réservation refusée : tous les exemplaires de cet ouvrage ont été retirés définitivement ou sont indisponibles de façon permanente.',
         409,
         'NO_CIRCULATING_COPIES'
       );
@@ -838,8 +1166,8 @@ export class LibraryService {
 
     this.db
       .prepare(
-        `INSERT INTO reservations (id, memberId, bookId, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
-         VALUES (?, ?, ?, ?, ?, 'En attente', NULL, NULL, NULL, NULL)`
+        `INSERT INTO reservations (id, memberId, bookId, requestType, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
+         VALUES (?, ?, ?, 'reservation_fifo', ?, ?, 'En attente', NULL, NULL, NULL, NULL)`
       )
       .run(reservationId, memberId, bookId, requestedAt, queuePosition);
 
@@ -847,8 +1175,8 @@ export class LibraryService {
 
     this.insertNotificationInternal(
       memberId,
-      'Réservation enregistrée',
-      `Votre réservation a été enregistrée. Vous serez informé dès qu'un exemplaire sera disponible. Aucune date de disponibilité n'est garantie.`,
+      'Réservation FIFO enregistrée',
+      `Votre réservation pour « ${String(book.title)} » a été enregistrée (rang n° ${queuePosition}). Vous serez informé dès qu’un exemplaire sera disponible. Aucune date de disponibilité n’est garantie.`,
       'reservation',
       now
     );
@@ -862,14 +1190,14 @@ export class LibraryService {
       now
     );
 
-    return this.getReservationByIdInternal(reservationId)!;
+    return this.getReservationByIdInternal(reservationId, Boolean(options?.hideBarcode))!;
   }
 
   public reserveBook(memberId: string, bookId: string, now: Date = new Date()): ReservationRecord {
     const tx = this.db.transaction(() => {
       this.syncOverdueLoansInternal(now);
       this.expireOverdueReservationsInternal(now);
-      return this.reserveBookInternal(memberId, bookId, now);
+      return this.reserveBookInternal(memberId, bookId, now, null, { hideBarcode: true });
     });
 
     return tx.immediate();
@@ -925,30 +1253,39 @@ export class LibraryService {
         .prepare(`SELECT title FROM books WHERE id = ?`)
         .get(bookId) as { title: string } | undefined;
 
+      const is24hHold = status === 'Retenu 24h';
       this.insertNotificationInternal(
         memberId,
-        'Réservation annulée',
-        `Votre réservation pour « ${book?.title || 'Ouvrage'} » a été annulée.`,
+        is24hHold ? 'Retenue 24 h annulée' : 'Réservation annulée',
+        is24hHold
+          ? `Votre retenue de 24 h pour « ${book?.title || 'Ouvrage'} » a été annulée.`
+          : `Votre réservation pour « ${book?.title || 'Ouvrage'} » a été annulée.`,
         'annulation',
         now
       );
 
       this.insertAuditLogInternal(
         actor,
-        'RESERVATION_CANCELLED',
+        is24hHold ? 'RESERVATION_HOLD_24H_CANCELLED' : 'RESERVATION_CANCELLED',
         'reservation',
         reservationId,
-        `Réservation ${reservationId} pour « ${book?.title || 'Ouvrage'} » annulée (statut précédent : ${status}).`,
+        `${is24hHold ? 'Retenue 24 h' : 'Réservation'} ${reservationId} pour « ${book?.title || 'Ouvrage'} » annulée (statut précédent : ${status}).`,
         now
       );
 
       if (assignedCopyId) {
-        this.assignCopyToNextEligibleReservationInternal(bookId, assignedCopyId, now, actor);
+        this.assignCopyToNextEligibleReservationInternal(
+          bookId,
+          assignedCopyId,
+          now,
+          actor,
+          is24hHold ? 'Retenu 24h' : 'Réservé'
+        );
       }
 
       this.recalculateQueuePositionsInternal(bookId);
 
-      return this.getReservationByIdInternal(reservationId)!;
+      return this.getReservationByIdInternal(reservationId, actor.role !== 'bibliothecaire')!;
     });
 
     return tx.immediate();
@@ -981,6 +1318,13 @@ export class LibraryService {
       const memberId = String(loan.memberId);
       const nowIso = now.toISOString();
 
+      const copyRow = this.db
+        .prepare(`SELECT barcode FROM copies WHERE id = ?`)
+        .get(copyId) as { barcode: string } | undefined;
+      const book = this.db
+        .prepare(`SELECT title FROM books WHERE id = ?`)
+        .get(bookId) as { title: string } | undefined;
+
       this.db
         .prepare(
           `UPDATE loans
@@ -1002,6 +1346,22 @@ export class LibraryService {
              WHERE id = ?`
           )
           .run(copyId);
+
+        this.insertCopyStateLogInternal(
+          {
+            copyId,
+            copyBarcode: copyRow?.barcode || copyId,
+            bookId,
+            bookTitle: book?.title || 'Ouvrage',
+            oldStatus: 'Emprunté',
+            newStatus: 'En réparation',
+            memberId,
+            agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+            requestOrLoanId: loanId,
+            summary: `Retour endommagé mais réparable : exemplaire placé en réparation.`,
+          },
+          now
+        );
       } else if (outcome === 'retire_definitivement') {
         this.db
           .prepare(
@@ -1013,6 +1373,22 @@ export class LibraryService {
              WHERE id = ?`
           )
           .run(copyId);
+
+        this.insertCopyStateLogInternal(
+          {
+            copyId,
+            copyBarcode: copyRow?.barcode || copyId,
+            bookId,
+            bookTitle: book?.title || 'Ouvrage',
+            oldStatus: 'Emprunté',
+            newStatus: 'Retiré définitivement',
+            memberId,
+            agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+            requestOrLoanId: loanId,
+            summary: `Retour irréparable : exemplaire retiré définitivement.`,
+          },
+          now
+        );
       } else {
         const usableCondition: PhysicalCondition =
           physicalCondition === 'Endommagé' || physicalCondition === 'Hors service'
@@ -1031,13 +1407,10 @@ export class LibraryService {
           bookId,
           copyId,
           now,
-          actor
+          actor,
+          'Emprunté'
         );
       }
-
-      const book = this.db
-        .prepare(`SELECT title FROM books WHERE id = ?`)
-        .get(bookId) as { title: string } | undefined;
 
       this.insertNotificationInternal(
         memberId,
@@ -1138,6 +1511,9 @@ export class LibraryService {
       }
 
       const bookId = String(copy.bookId);
+      const bookRow = this.db
+        .prepare(`SELECT title FROM books WHERE id = ?`)
+        .get(bookId) as { title: string } | undefined;
       let assignedReservationId: string | null = null;
 
       if (outcome === 'reutilisable') {
@@ -1156,7 +1532,8 @@ export class LibraryService {
           bookId,
           copyId,
           now,
-          actor
+          actor,
+          'En réparation'
         );
       } else if (outcome === 'endommage') {
         this.db
@@ -1180,6 +1557,20 @@ export class LibraryService {
              WHERE id = ?`
           )
           .run(copyId);
+
+        this.insertCopyStateLogInternal(
+          {
+            copyId,
+            copyBarcode: String(copy.barcode),
+            bookId,
+            bookTitle: bookRow?.title || 'Ouvrage',
+            oldStatus: 'En réparation',
+            newStatus: 'Retiré définitivement',
+            agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+            summary: `Inspection post-réparation défavorable : exemplaire retiré définitivement.`,
+          },
+          now
+        );
       }
 
       this.insertAuditLogInternal(
@@ -1232,8 +1623,9 @@ export class LibraryService {
       // Vérifier l'éligibilité du membre au moment de la confirmation
       this.assertEligibleInternal(memberId, now);
 
+      const settings = this.getSettings();
       const nowIso = now.toISOString();
-      const pickupDeadline = addDaysIso(now, PICKUP_WINDOW_DAYS);
+      const pickupDeadline = addDaysIso(now, settings.pickupWindowDays);
 
       this.db
         .prepare(
@@ -1263,8 +1655,24 @@ export class LibraryService {
       this.insertNotificationInternal(
         memberId,
         'Ouvrage disponible pour retrait',
-        `Votre exemplaire de « ${book?.title || 'Ouvrage'} » (${copy?.barcode || ''}) est désormais disponible au guichet de la bibliothèque. Vous disposez de 3 jours pour le retirer, jusqu’au ${formatFrenchDateTime(pickupDeadline)}.`,
+        `Votre réservation pour « ${book?.title || 'Ouvrage'} » est désormais disponible au guichet de la bibliothèque. Présentez votre carte membre dans un délai de 3 jours, jusqu’au ${formatFrenchDateTime(pickupDeadline)}.`,
         'retrait',
+        now
+      );
+
+      this.insertCopyStateLogInternal(
+        {
+          copyId,
+          copyBarcode: copy?.barcode || copyId,
+          bookId,
+          bookTitle: book?.title || 'Ouvrage',
+          oldStatus: 'Disponible',
+          newStatus: 'Réservé',
+          memberId,
+          agent: actor,
+          requestOrLoanId: reservationId,
+          summary: `Mise à disposition confirmée pour retrait au comptoir (3 jours).`,
+        },
         now
       );
 
@@ -1277,7 +1685,7 @@ export class LibraryService {
         now
       );
 
-      return this.getReservationByIdInternal(reservationId)!;
+      return this.getReservationByIdInternal(reservationId, false)!;
     });
 
     return tx.immediate();
@@ -1316,7 +1724,8 @@ export class LibraryService {
         bookId,
         String(availableCopy.id),
         now,
-        actor
+        actor,
+        'Disponible'
       );
 
       if (!assignedId) {
@@ -1328,7 +1737,7 @@ export class LibraryService {
       }
 
       return {
-        reservation: this.getReservationByIdInternal(assignedId)!,
+        reservation: this.getReservationByIdInternal(assignedId, false)!,
         copy: this.getCopyByIdInternal(String(availableCopy.id))!,
       };
     });
@@ -1352,9 +1761,13 @@ export class LibraryService {
       if (!res) {
         throw new DomainError('Réservation introuvable.', 404, 'RESERVATION_NOT_FOUND');
       }
-      if (String(res.status) !== 'Disponible pour retrait' || !res.assignedCopyId) {
+      const resStatus = String(res.status);
+      if (
+        (resStatus !== 'Disponible pour retrait' && resStatus !== 'Retenu 24h') ||
+        !res.assignedCopyId
+      ) {
         throw new DomainError(
-          'Cette réservation n’est pas prête pour un retrait (ou son délai a expiré).',
+          'Cette demande n’est pas prête pour un retrait (ou son délai a expiré).',
           409,
           'RESERVATION_NOT_READY'
         );
@@ -1366,9 +1779,25 @@ export class LibraryService {
 
       this.assertEligibleInternal(memberId, now);
 
+      const existingLoan = this.db
+        .prepare(`SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`)
+        .get(memberId, bookId);
+      if (existingLoan) {
+        throw new DomainError(
+          'Ce membre détient déjà un emprunt actif pour cet ouvrage.',
+          409,
+          'DUPLICATE_ACTIVE_LOAN'
+        );
+      }
+
+      const settings = this.getSettings();
       const nowIso = now.toISOString();
-      const dueAt = addDaysIso(now, BORROWING_DURATION_DAYS);
+      const dueAt = addDaysIso(now, settings.borrowingDurationDays);
       const loanId = this.generateId('ln');
+
+      const copyRow = this.db
+        .prepare(`SELECT barcode, status FROM copies WHERE id = ?`)
+        .get(copyId) as { barcode: string; status: CopyStatus } | undefined;
 
       this.db
         .prepare(
@@ -1379,7 +1808,7 @@ export class LibraryService {
         .run(nowIso, reservationId);
 
       this.db
-        .prepare(`UPDATE copies SET status = 'Emprunté' WHERE id = ?`)
+        .prepare(`UPDATE copies SET status = 'Emprunté', location = 'En prêt membre' WHERE id = ?`)
         .run(copyId);
 
       this.db
@@ -1393,10 +1822,26 @@ export class LibraryService {
         .prepare(`SELECT title FROM books WHERE id = ?`)
         .get(bookId) as { title: string } | undefined;
 
+      this.insertCopyStateLogInternal(
+        {
+          copyId,
+          copyBarcode: copyRow?.barcode || copyId,
+          bookId,
+          bookTitle: book?.title || 'Ouvrage',
+          oldStatus: copyRow?.status || (resStatus === 'Retenu 24h' ? 'Retenu 24h' : 'Réservé'),
+          newStatus: 'Emprunté',
+          memberId,
+          agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+          requestOrLoanId: loanId,
+          summary: `Retrait validé au comptoir (${resStatus === 'Retenu 24h' ? 'retenue 24 h' : 'réservation FIFO'}) : prêt 7 jours créé.`,
+        },
+        now
+      );
+
       this.insertNotificationInternal(
         memberId,
-        'Retrait de réservation confirmé',
-        `Vous avez retiré « ${book?.title || 'Ouvrage'} ». Date limite de retour : ${formatFrenchDateTime(dueAt)}.`,
+        'Retrait confirmé au comptoir',
+        `Votre emprunt pour « ${book?.title || 'Ouvrage'} » (exemplaire ${copyRow?.barcode || ''}) est validé. Date limite de retour : ${formatFrenchDateTime(dueAt)}.`,
         'emprunt',
         now
       );
@@ -1406,7 +1851,7 @@ export class LibraryService {
         'RESERVATION_PICKED_UP',
         'loan',
         loanId,
-        `Retrait de réservation ${reservationId} validé : prêt ${loanId} créé pour « ${book?.title || 'Ouvrage'} ».`,
+        `Retrait validé (${reservationId}) : prêt ${loanId} créé pour « ${book?.title || 'Ouvrage'} » (${copyRow?.barcode || copyId}).`,
         now
       );
 
@@ -1444,16 +1889,18 @@ export class LibraryService {
          LEFT JOIN copies c ON c.id = r.assignedCopyId
          WHERE r.memberId = ?
          ORDER BY CASE
-                    WHEN r.status = 'Disponible pour retrait' THEN 0
-                    WHEN r.status = 'Exemplaire attribué' THEN 1
-                    WHEN r.status = 'En attente' THEN 2
-                    ELSE 3
+                    WHEN r.status = 'Retenu 24h' THEN 0
+                    WHEN r.status = 'Disponible pour retrait' THEN 1
+                    WHEN r.status = 'Exemplaire attribué' THEN 2
+                    WHEN r.status = 'En attente' THEN 3
+                    ELSE 4
                   END,
                   r.requestedAt DESC`
       )
       .all(memberId) as Array<Record<string, unknown>>;
 
-    return rows.map((r) => this.mapReservationRow(r, false));
+    // Ne jamais exposer les codes-barres physiques des exemplaires dans le parcours public du membre
+    return rows.map((r) => this.mapReservationRow(r, false, true));
   }
 
   public getMemberNotifications(memberId: string): NotificationRecord[] {
@@ -1501,6 +1948,7 @@ export class LibraryService {
           COUNT(*) as allRows,
           COALESCE(SUM(CASE WHEN status != 'Retiré définitivement' THEN 1 ELSE 0 END), 0) as totalPhysical,
           COALESCE(SUM(CASE WHEN status = 'Disponible' AND needsInspection = 0 THEN 1 ELSE 0 END), 0) as available,
+          COALESCE(SUM(CASE WHEN status = 'Retenu 24h' THEN 1 ELSE 0 END), 0) as held24h,
           COALESCE(SUM(CASE WHEN status = 'Emprunté' THEN 1 ELSE 0 END), 0) as borrowed,
           COALESCE(SUM(CASE WHEN status = 'Réservé' THEN 1 ELSE 0 END), 0) as reserved,
           COALESCE(SUM(CASE WHEN status = 'En réparation' THEN 1 ELSE 0 END), 0) as repair,
@@ -1514,7 +1962,7 @@ export class LibraryService {
         `SELECT
           COALESCE(SUM(CASE WHEN status = 'En attente' THEN 1 ELSE 0 END), 0) as pending,
           COALESCE(SUM(CASE WHEN status = 'Exemplaire attribué' THEN 1 ELSE 0 END), 0) as allocated,
-          COALESCE(SUM(CASE WHEN status = 'Disponible pour retrait' THEN 1 ELSE 0 END), 0) as awaitingPickup
+          COALESCE(SUM(CASE WHEN status IN ('Disponible pour retrait', 'Retenu 24h') THEN 1 ELSE 0 END), 0) as awaitingPickup
          FROM reservations`
       )
       .get() as Record<string, number>;
@@ -1532,6 +1980,7 @@ export class LibraryService {
       totalTitles: titlesRow.cnt,
       totalPhysicalCopies: copyStats.totalPhysical || 0,
       availableCopies: copyStats.available || 0,
+      held24hCopies: copyStats.held24h || 0,
       borrowedCopies: copyStats.borrowed || 0,
       reservedCopies: copyStats.reserved || 0,
       repairCopies: copyStats.repair || 0,
@@ -1563,6 +2012,69 @@ export class LibraryService {
     return rows.map((r) => this.mapLoanRow(r, true));
   }
 
+  public notifyOverdueMembersAdmin(
+    actor?: AuditActor | null,
+    now: Date = new Date()
+  ): {
+    overdueLoansCount: number;
+    recipients: OverdueEmailRecipient[];
+  } {
+    this.syncOverdueLoansInternal(now);
+    const overdueLoans = this.getAllLoansAdmin(now).filter((l) => l.status === 'En retard');
+    if (overdueLoans.length === 0) {
+      return { overdueLoansCount: 0, recipients: [] };
+    }
+
+    const byMember = new Map<string, OverdueEmailRecipient>();
+    for (const loan of overdueLoans) {
+      const email = (loan.memberEmail || '').trim();
+      if (!email) continue;
+      const existing = byMember.get(loan.memberId);
+      const bookEntry = {
+        title: loan.bookTitle,
+        barcode: loan.copyBarcode,
+        dueAt: loan.dueAt,
+      };
+      if (existing) {
+        existing.books.push(bookEntry);
+      } else {
+        byMember.set(loan.memberId, {
+          memberId: loan.memberId,
+          memberName: loan.memberName || email,
+          memberEmail: email,
+          books: [bookEntry],
+          emailSent: false,
+        });
+      }
+    }
+
+    const recipients = Array.from(byMember.values());
+    const tx = this.db.transaction(() => {
+      for (const r of recipients) {
+        const titles = r.books.map((b) => `« ${b.title} » (${b.barcode})`).join(', ');
+        this.insertNotificationInternal(
+          r.memberId,
+          'Rappel — Emprunt en retard',
+          `Bonjour ${r.memberName}, merci de restituer sans délai le(s) ouvrage(s) en retard : ${titles}.`,
+          'rappel',
+          now
+        );
+      }
+
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'OVERDUE_MEMBERS_NOTIFIED',
+        'loan',
+        'overdue-batch',
+        `Notification de retard déclenchée pour ${recipients.length} membre(s) (${overdueLoans.length} emprunt(s) en retard).`,
+        now
+      );
+    });
+
+    tx.immediate();
+    return { overdueLoansCount: overdueLoans.length, recipients };
+  }
+
   public getAllReservationsAdmin(now: Date = new Date()): ReservationRecord[] {
     this.processDeadlines(now);
     const rows = this.db
@@ -1575,10 +2087,11 @@ export class LibraryService {
          JOIN users u ON u.id = r.memberId
          LEFT JOIN copies c ON c.id = r.assignedCopyId
          ORDER BY CASE r.status
-                    WHEN 'Exemplaire attribué' THEN 0
+                    WHEN 'Retenu 24h' THEN 0
                     WHEN 'Disponible pour retrait' THEN 1
-                    WHEN 'En attente' THEN 2
-                    ELSE 3
+                    WHEN 'Exemplaire attribué' THEN 2
+                    WHEN 'En attente' THEN 3
+                    ELSE 4
                   END,
                   r.requestedAt ASC, r.rowid ASC, r.id ASC`
       )
@@ -1595,10 +2108,11 @@ export class LibraryService {
          JOIN books b ON b.id = c.bookId
          ORDER BY CASE c.status
                     WHEN 'En réparation' THEN 0
-                    WHEN 'Réservé' THEN 1
-                    WHEN 'Emprunté' THEN 2
-                    WHEN 'Disponible' THEN 3
-                    ELSE 4
+                    WHEN 'Retenu 24h' THEN 1
+                    WHEN 'Réservé' THEN 2
+                    WHEN 'Emprunté' THEN 3
+                    WHEN 'Disponible' THEN 4
+                    ELSE 5
                   END,
                   c.barcode ASC`
       )
@@ -1759,6 +2273,20 @@ export class LibraryService {
           now.toISOString()
         );
 
+      this.insertCopyStateLogInternal(
+        {
+          copyId,
+          copyBarcode: input.barcode.trim(),
+          bookId,
+          bookTitle: book.title,
+          oldStatus: null,
+          newStatus: initialStatus,
+          agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+          summary: `Enregistrement d’un nouvel exemplaire (${initialStatus}).`,
+        },
+        now
+      );
+
       this.insertAuditLogInternal(
         actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
         'COPY_REGISTERED',
@@ -1774,7 +2302,8 @@ export class LibraryService {
           bookId,
           copyId,
           now,
-          actor
+          actor,
+          'Disponible'
         );
       }
 
@@ -1782,6 +2311,168 @@ export class LibraryService {
         copy: this.getCopyByIdInternal(copyId)!,
         assignedReservationId,
       };
+    });
+
+    return tx.immediate();
+  }
+
+  public registerCopiesBatch(
+    bookId: string,
+    input: {
+      barcodes: string[];
+      physicalCondition: PhysicalCondition;
+      location: string;
+    },
+    now: Date = new Date(),
+    actor?: AuditActor | null
+  ): {
+    created: Copy[];
+    skippedBarcodes: string[];
+    assignedReservationsCount: number;
+  } {
+    const tx = this.db.transaction(() => {
+      const book = this.db.prepare(`SELECT id, title FROM books WHERE id = ?`).get(bookId) as
+        | { id: string; title: string }
+        | undefined;
+      if (!book) {
+        throw new DomainError('Ouvrage introuvable.', 404, 'BOOK_NOT_FOUND');
+      }
+
+      const cleaned = Array.from(
+        new Set(input.barcodes.map((b) => b.trim()).filter(Boolean))
+      );
+      if (cleaned.length === 0) {
+        throw new DomainError(
+          'Veuillez saisir au moins un code-barres valide.',
+          400,
+          'EMPTY_BARCODES'
+        );
+      }
+
+      const created: Copy[] = [];
+      const skippedBarcodes: string[] = [];
+      let assignedReservationsCount = 0;
+
+      const isDamaged =
+        input.physicalCondition === 'Endommagé' || input.physicalCondition === 'Hors service';
+      const initialStatus: CopyStatus =
+        input.physicalCondition === 'Hors service'
+          ? 'Retiré définitivement'
+          : input.physicalCondition === 'Endommagé'
+            ? 'En réparation'
+            : 'Disponible';
+
+      for (const barcode of cleaned) {
+        const dup = this.db
+          .prepare(`SELECT id FROM copies WHERE barcode = ?`)
+          .get(barcode);
+        if (dup) {
+          skippedBarcodes.push(barcode);
+          continue;
+        }
+
+        const copyId = this.generateId('cp');
+        this.db
+          .prepare(
+            `INSERT INTO copies (id, bookId, barcode, status, physicalCondition, location, needsInspection, createdAt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            copyId,
+            bookId,
+            barcode,
+            initialStatus,
+            input.physicalCondition,
+            input.location.trim(),
+            input.physicalCondition === 'Endommagé' ? 1 : 0,
+            now.toISOString()
+          );
+
+        this.insertCopyStateLogInternal(
+          {
+            copyId,
+            copyBarcode: barcode,
+            bookId,
+            bookTitle: book.title,
+            oldStatus: null,
+            newStatus: initialStatus,
+            agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+            summary: `Ajout en lot de l’exemplaire (${initialStatus}).`,
+          },
+          now
+        );
+
+        if (!isDamaged) {
+          const assigned = this.assignCopyToNextEligibleReservationInternal(
+            bookId,
+            copyId,
+            now,
+            actor,
+            'Disponible'
+          );
+          if (assigned) assignedReservationsCount += 1;
+        }
+
+        const row = this.getCopyByIdInternal(copyId);
+        if (row) created.push(row);
+      }
+
+      this.insertAuditLogInternal(
+        actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+        'COPIES_BATCH_REGISTERED',
+        'book',
+        bookId,
+        `Ajout en lot de ${created.length} exemplaire(s) pour « ${book.title} » (${skippedBarcodes.length} ignoré(s)).`,
+        now
+      );
+
+      return { created, skippedBarcodes, assignedReservationsCount };
+    });
+
+    return tx.immediate();
+  }
+
+  public toggleLoanOverdueTest(
+    loanId: string,
+    actor: AuditActor,
+    now: Date = new Date()
+  ): LoanRecord {
+    const tx = this.db.transaction(() => {
+      const loan = this.db
+        .prepare(`SELECT * FROM loans WHERE id = ?`)
+        .get(loanId) as Record<string, unknown> | undefined;
+      if (!loan) {
+        throw new DomainError('Opération d’emprunt introuvable.', 404, 'LOAN_NOT_FOUND');
+      }
+      if (String(loan.status) === 'Retourné') {
+        throw new DomainError(
+          'Impossible de modifier l’état d’un emprunt déjà restitué.',
+          409,
+          'LOAN_ALREADY_RETURNED'
+        );
+      }
+
+      const settings = this.getSettings();
+      const currentlyOverdue = String(loan.status) === 'En retard';
+      const nextStatus = currentlyOverdue ? 'En cours' : 'En retard';
+      const nextDueAt = currentlyOverdue
+        ? addDaysIso(now, settings.borrowingDurationDays)
+        : addDaysIso(now, -3);
+
+      this.db
+        .prepare(`UPDATE loans SET status = ?, dueAt = ? WHERE id = ?`)
+        .run(nextStatus, nextDueAt, loanId);
+
+      this.insertAuditLogInternal(
+        actor,
+        'LOAN_OVERDUE_TEST_TOGGLED',
+        'loan',
+        loanId,
+        `État de test de l’emprunt ${loanId} basculé vers « ${nextStatus} » (échéance : ${formatFrenchDateTime(nextDueAt)}).`,
+        now
+      );
+
+      return this.getLoanByIdInternal(loanId)!;
     });
 
     return tx.immediate();
@@ -1811,6 +2502,10 @@ export class LibraryService {
         );
       }
 
+      const bookTitleRow = this.db
+        .prepare(`SELECT title FROM books WHERE id = ?`)
+        .get(String(existing.bookId)) as { title: string } | undefined;
+
       if (status === 'Disponible') {
         this.db
           .prepare(
@@ -1821,7 +2516,8 @@ export class LibraryService {
           String(existing.bookId),
           copyId,
           now,
-          actor
+          actor,
+          existing.status as CopyStatus
         );
       } else {
         this.db
@@ -1835,6 +2531,22 @@ export class LibraryService {
             status === 'En réparation' ? 1 : 0,
             copyId
           );
+
+        if (String(existing.status) !== status) {
+          this.insertCopyStateLogInternal(
+            {
+              copyId,
+              copyBarcode: String(existing.barcode),
+              bookId: String(existing.bookId),
+              bookTitle: bookTitleRow?.title || 'Ouvrage',
+              oldStatus: existing.status as CopyStatus,
+              newStatus: status,
+              agent: actor || { id: 'bibliothecaire', role: 'bibliothecaire' },
+              summary: `Statut modifié manuellement par le personnel (${physicalCondition}).`,
+            },
+            now
+          );
+        }
       }
 
       this.insertAuditLogInternal(
@@ -1852,16 +2564,8 @@ export class LibraryService {
     return tx.immediate();
   }
 
-  public listMembersAdmin(): UserPublic[] {
-    const rows = this.db
-      .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
-         FROM users
-         ORDER BY isDemo ASC, role DESC, fullName ASC`
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    return rows.map((row) => ({
+  private mapUserPublicRow(row: Record<string, unknown>): UserPublic {
+    return {
       id: String(row.id),
       fullName: String(row.fullName),
       email: String(row.email),
@@ -1869,12 +2573,26 @@ export class LibraryService {
       institution: String(row.institution),
       studentStatus: row.studentStatus as StudentStatus,
       accountStatus: row.accountStatus as AccountStatus,
+      emailVerified: row.emailVerified === undefined ? true : Boolean(row.emailVerified),
+      isAdmin: Boolean(row.isAdmin),
       cne: row.cne ? String(row.cne) : null,
       filiere: row.filiere ? String(row.filiere) : null,
       authSource: row.authSource as UserPublic['authSource'],
       isDemo: Boolean(row.isDemo),
       createdAt: String(row.createdAt),
-    }));
+    };
+  }
+
+  public listMembersAdmin(): UserPublic[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+         FROM users
+         ORDER BY isDemo ASC, role DESC, isAdmin DESC, fullName ASC`
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map((row) => this.mapUserPublicRow(row));
   }
 
   public updateMemberVerificationAdmin(
@@ -1900,31 +2618,340 @@ export class LibraryService {
       'MEMBER_VERIFICATION_UPDATED',
       'user',
       userId,
-      `Statut de ${existing.fullName} (${existing.email}) mis à jour : éligibilité=${studentStatus}, compte=${accountStatus}.`,
+      `Statut de ${existing.fullName} (${existing.email}) mis à jour : statut EST=${studentStatus}, compte=${accountStatus}.`,
       now
     );
 
     const row = this.db
       .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+         FROM users WHERE id = ?`
+      )
+      .get(userId) as Record<string, unknown>;
+
+    return this.mapUserPublicRow(row);
+  }
+
+  public updateStaffRoleAdmin(
+    targetUserId: string,
+    role: UserRole,
+    isAdminFlag: boolean,
+    actor: AuditActor & { id: string },
+    now: Date = new Date()
+  ): UserPublic {
+    const existing = this.db
+      .prepare(`SELECT id, fullName, email, role, isAdmin FROM users WHERE id = ?`)
+      .get(targetUserId) as
+      | { id: string; fullName: string; email: string; role: UserRole; isAdmin: number }
+      | undefined;
+
+    if (!existing) {
+      throw new DomainError('Compte utilisateur introuvable.', 404, 'USER_NOT_FOUND');
+    }
+
+    const nextIsAdmin = role === 'bibliothecaire' && isAdminFlag;
+
+    if (actor.id === targetUserId && !nextIsAdmin) {
+      throw new DomainError(
+        'Un administrateur ne peut pas révoquer ses propres droits d’administration.',
+        409,
+        'CANNOT_REVOKE_OWN_ADMIN'
+      );
+    }
+
+    if (Boolean(existing.isAdmin) && !nextIsAdmin) {
+      const otherAdmins = this.db
+        .prepare(`SELECT COUNT(*) as cnt FROM users WHERE isAdmin = 1 AND id != ?`)
+        .get(targetUserId) as { cnt: number };
+      if (otherAdmins.cnt === 0) {
+        throw new DomainError(
+          'Au moins un administrateur de la bibliothèque doit rester actif.',
+          409,
+          'LAST_ADMIN_REQUIRED'
+        );
+      }
+    }
+
+    if (role === 'bibliothecaire') {
+      this.db
+        .prepare(
+          `UPDATE users SET role = 'bibliothecaire', isAdmin = ?, studentStatus = 'verifie', emailVerified = 1 WHERE id = ?`
+        )
+        .run(nextIsAdmin ? 1 : 0, targetUserId);
+    } else {
+      this.db
+        .prepare(`UPDATE users SET role = 'membre', isAdmin = 0 WHERE id = ?`)
+        .run(targetUserId);
+    }
+
+    this.insertAuditLogInternal(
+      actor,
+      'STAFF_ROLE_UPDATED',
+      'user',
+      targetUserId,
+      `Rôle de ${existing.fullName} (${existing.email}) modifié : ${role}${nextIsAdmin ? ' (Administrateur)' : ''}.`,
+      now
+    );
+
+    const row = this.db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+         FROM users WHERE id = ?`
+      )
+      .get(targetUserId) as Record<string, unknown>;
+
+    return this.mapUserPublicRow(row);
+  }
+
+  public registerAcademicCandidate(
+    input: {
+      fullName: string;
+      email: string;
+      password: string;
+      filiere?: string | null;
+      cne?: string | null;
+    },
+    now: Date = new Date()
+  ): { user: UserPublic; verificationCode: string; expiresAt: string } {
+    const email = input.email.trim().toLowerCase();
+    const fullName = input.fullName.trim();
+    if (!fullName || fullName.length < 2) {
+      throw new DomainError('Le nom complet est obligatoire.', 400, 'INVALID_FULL_NAME');
+    }
+    if (!email || !email.includes('@')) {
+      throw new DomainError('Adresse e-mail académique invalide.', 400, 'INVALID_EMAIL');
+    }
+    if (!input.password || input.password.length < 8) {
+      throw new DomainError(
+        'Le mot de passe de connexion doit contenir au moins 8 caractères.',
+        400,
+        'WEAK_PASSWORD'
+      );
+    }
+
+    const domain = email.split('@')[1] || '';
+    const isAllowedDomain =
+      domain === 'usmba.ac.ma' ||
+      domain === 'est-usmba.ac.ma' ||
+      domain.endsWith('.ac.ma') ||
+      domain.endsWith('.edu.ma') ||
+      (this.isDemoSandbox && domain.endsWith('.example'));
+
+    if (!isAllowedDomain) {
+      throw new DomainError(
+        this.isDemoSandbox
+          ? 'Utilisez une adresse académique existante (@usmba.ac.ma, @est-usmba.ac.ma) ou fictive sous le domaine .example en mode Démo.'
+          : 'Utilisez une adresse académique déjà fournie par l’établissement (ex. @usmba.ac.ma ou @est-usmba.ac.ma). BiblioEST ne crée pas de boîte e-mail scolaire.',
+        400,
+        'NON_ACADEMIC_EMAIL'
+      );
+    }
+
+    const existing = this.db
+      .prepare(`SELECT id FROM users WHERE LOWER(email) = LOWER(?)`)
+      .get(email);
+    if (existing) {
+      throw new DomainError(
+        'Un compte existe déjà pour cette adresse e-mail académique.',
+        409,
+        'EMAIL_ALREADY_REGISTERED'
+      );
+    }
+
+    const userId = this.generateId('usr');
+    const passwordHash = hashPassword(input.password);
+    const verificationCode = String(crypto.randomInt(100000, 999999));
+    const expiresAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+    const institution = domain === 'est-usmba.ac.ma' || domain.includes('est') ? 'EST Fès' : 'USMBA';
+
+    const tx = this.db.transaction(() => {
+      // Règle métier : l'inscription publique crée uniquement un membre avec e-mail non vérifié et statut EST en attente.
+      this.db
+        .prepare(
+          `INSERT INTO users (id, fullName, email, passwordHash, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt)
+           VALUES (?, ?, ?, ?, 'membre', ?, 'en_attente', 'actif', 0, 0, ?, ?, 'local', ?, ?)`
+        )
+        .run(
+          userId,
+          fullName,
+          email,
+          passwordHash,
+          institution,
+          input.cne?.trim() || null,
+          input.filiere?.trim() || null,
+          this.isDemoSandbox ? 1 : 0,
+          now.toISOString()
+        );
+
+      this.db
+        .prepare(
+          `INSERT INTO email_verification_codes (id, userId, email, code, expiresAt, consumedAt, createdAt)
+           VALUES (?, ?, ?, ?, ?, NULL, ?)`
+        )
+        .run(this.generateId('otp'), userId, email, verificationCode, expiresAt, now.toISOString());
+
+      this.insertAuditLogInternal(
+        { id: userId, fullName, role: 'membre' },
+        'MEMBER_REGISTERED_PENDING_EMAIL',
+        'user',
+        userId,
+        `Inscription publique avec l’adresse académique existante ${email} (validation e-mail requise, statut EST en attente).`,
+        now
+      );
+
+      if (this.isDemoSandbox) {
+        this.recordSimulatedEmail(
+          {
+            recipientEmail: email,
+            subject: 'BiblioEST (Démo) — Code de vérification de votre adresse académique',
+            body: `Bonjour ${fullName},\n\nVotre code à usage unique pour valider votre adresse ${email} est : ${verificationCode}\nCe code est valable 15 minutes.\n\nRemarque : après validation de l’adresse, votre statut EST Fès reste en attente de validation par la bibliothèque.`,
+            category: 'verification',
+          },
+          now
+        );
+      }
+    });
+
+    tx.immediate();
+
+    const row = this.db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
          FROM users WHERE id = ?`
       )
       .get(userId) as Record<string, unknown>;
 
     return {
-      id: String(row.id),
-      fullName: String(row.fullName),
-      email: String(row.email),
-      role: row.role as UserPublic['role'],
-      institution: String(row.institution),
-      studentStatus: row.studentStatus as StudentStatus,
-      accountStatus: row.accountStatus as AccountStatus,
-      cne: row.cne ? String(row.cne) : null,
-      filiere: row.filiere ? String(row.filiere) : null,
-      authSource: row.authSource as UserPublic['authSource'],
-      isDemo: Boolean(row.isDemo),
-      createdAt: String(row.createdAt),
+      user: this.mapUserPublicRow(row),
+      verificationCode,
+      expiresAt,
     };
+  }
+
+  public verifyEmailCode(
+    emailInput: string,
+    codeInput: string,
+    now: Date = new Date()
+  ): UserPublic {
+    const email = emailInput.trim().toLowerCase();
+    const code = codeInput.trim();
+    if (!email || !code) {
+      throw new DomainError('Adresse e-mail et code de vérification requis.', 400, 'MISSING_OTP');
+    }
+
+    const user = this.db
+      .prepare(`SELECT id, fullName, email, emailVerified, studentStatus FROM users WHERE LOWER(email) = LOWER(?)`)
+      .get(email) as
+      | { id: string; fullName: string; email: string; emailVerified: number; studentStatus: StudentStatus }
+      | undefined;
+
+    if (!user) {
+      throw new DomainError('Aucun compte trouvé pour cette adresse e-mail.', 404, 'USER_NOT_FOUND');
+    }
+
+    const otpRow = this.db
+      .prepare(
+        `SELECT id, code, expiresAt, consumedAt
+         FROM email_verification_codes
+         WHERE userId = ? AND consumedAt IS NULL
+         ORDER BY createdAt DESC, rowid DESC
+         LIMIT 1`
+      )
+      .get(user.id) as
+      | { id: string; code: string; expiresAt: string; consumedAt: string | null }
+      | undefined;
+
+    if (!otpRow || otpRow.code !== code) {
+      throw new DomainError(
+        'Code de vérification invalide. Vérifiez le code reçu par e-mail.',
+        400,
+        'INVALID_OTP_CODE'
+      );
+    }
+
+    if (otpRow.expiresAt < now.toISOString()) {
+      throw new DomainError(
+        'Ce code à usage unique a expiré. Demandez un nouveau code.',
+        400,
+        'OTP_EXPIRED'
+      );
+    }
+
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(`UPDATE email_verification_codes SET consumedAt = ? WHERE id = ?`)
+        .run(now.toISOString(), otpRow.id);
+
+      // Diagramme 1 : adresse vérifiée ≠ statut EST vérifié -> studentStatus reste tel quel (en_attente).
+      this.db
+        .prepare(`UPDATE users SET emailVerified = 1 WHERE id = ?`)
+        .run(user.id);
+
+      this.insertAuditLogInternal(
+        { id: user.id, fullName: user.fullName, role: 'membre' },
+        'EMAIL_VERIFIED_AWAITING_EST',
+        'user',
+        user.id,
+        `Adresse académique ${user.email} vérifiée par code OTP. Statut EST Fès : ${user.studentStatus}.`,
+        now
+      );
+    });
+
+    tx.immediate();
+
+    const row = this.db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+         FROM users WHERE id = ?`
+      )
+      .get(user.id) as Record<string, unknown>;
+
+    return this.mapUserPublicRow(row);
+  }
+
+  public resendVerificationCode(
+    emailInput: string,
+    now: Date = new Date()
+  ): { email: string; verificationCode: string; expiresAt: string } {
+    const email = emailInput.trim().toLowerCase();
+    const user = this.db
+      .prepare(`SELECT id, fullName, email, emailVerified FROM users WHERE LOWER(email) = LOWER(?)`)
+      .get(email) as { id: string; fullName: string; email: string; emailVerified: number } | undefined;
+
+    if (!user) {
+      throw new DomainError('Aucun compte trouvé pour cette adresse e-mail.', 404, 'USER_NOT_FOUND');
+    }
+    if (Boolean(user.emailVerified)) {
+      throw new DomainError(
+        'Cette adresse e-mail est déjà vérifiée.',
+        409,
+        'EMAIL_ALREADY_VERIFIED'
+      );
+    }
+
+    const verificationCode = String(crypto.randomInt(100000, 999999));
+    const expiresAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+
+    this.db
+      .prepare(
+        `INSERT INTO email_verification_codes (id, userId, email, code, expiresAt, consumedAt, createdAt)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)`
+      )
+      .run(this.generateId('otp'), user.id, user.email, verificationCode, expiresAt, now.toISOString());
+
+    if (this.isDemoSandbox) {
+      this.recordSimulatedEmail(
+        {
+          recipientEmail: user.email,
+          subject: 'BiblioEST (Démo) — Nouveau code de vérification',
+          body: `Bonjour ${user.fullName},\n\nVotre nouveau code à usage unique est : ${verificationCode}\nValable 15 minutes.`,
+          category: 'verification',
+        },
+        now
+      );
+    }
+
+    return { email: user.email, verificationCode, expiresAt };
   }
 
   // --- Panier de demandes (ne réserve jamais d'exemplaire avant confirmation serveur) ---
@@ -1947,6 +2974,7 @@ export class LibraryService {
           COUNT(*) as allRows,
           COALESCE(SUM(CASE WHEN status != 'Retiré définitivement' THEN 1 ELSE 0 END), 0) as totalPhysical,
           COALESCE(SUM(CASE WHEN status = 'Disponible' AND needsInspection = 0 AND physicalCondition NOT IN ('Endommagé', 'Hors service') THEN 1 ELSE 0 END), 0) as available,
+          COALESCE(SUM(CASE WHEN status = 'Retenu 24h' THEN 1 ELSE 0 END), 0) as held24h,
           COALESCE(SUM(CASE WHEN status = 'Emprunté' THEN 1 ELSE 0 END), 0) as borrowed,
           COALESCE(SUM(CASE WHEN status = 'Réservé' THEN 1 ELSE 0 END), 0) as reserved,
           COALESCE(SUM(CASE WHEN status = 'En réparation' THEN 1 ELSE 0 END), 0) as repair,
@@ -1961,6 +2989,7 @@ export class LibraryService {
       statsMap.set(String(row.bookId), {
         totalPhysical: Number(row.totalPhysical || 0),
         available: Number(row.available || 0),
+        held24h: Number(row.held24h || 0),
         borrowed: Number(row.borrowed || 0),
         reserved: Number(row.reserved || 0),
         repair: Number(row.repair || 0),
@@ -1973,6 +3002,7 @@ export class LibraryService {
       const st = statsMap.get(bookId) || {
         totalPhysical: 0,
         available: 0,
+        held24h: 0,
         borrowed: 0,
         reserved: 0,
         repair: 0,
@@ -2002,6 +3032,7 @@ export class LibraryService {
           createdAt: String(row.createdAt),
           totalCopies: st.totalPhysical,
           availableCopies: st.available,
+          held24hCopies: st.held24h,
           borrowedCopies: st.borrowed,
           reservedCopies: st.reserved,
           repairCopies: st.repair,
@@ -2113,7 +3144,7 @@ export class LibraryService {
 
       const items = this.db
         .prepare(
-          `SELECT ci.id, ci.bookId, ci.quantity, b.title as bookTitle
+          `SELECT ci.id, ci.bookId, ci.quantity, b.title as bookTitle, b.archived as bookArchived
            FROM cart_items ci
            JOIN books b ON b.id = ci.bookId
            WHERE ci.userId = ?
@@ -2124,15 +3155,19 @@ export class LibraryService {
         bookId: string;
         quantity: number;
         bookTitle: string;
+        bookArchived: number;
       }>;
 
       if (items.length === 0) {
         throw new DomainError('Votre panier de demandes est vide.', 400, 'EMPTY_CART');
       }
 
-      const eligibility = this.checkEligibility(memberId, now);
+      // Diagramme 1 : vérifier l'éligibilité du membre avant tout traitement des lignes.
+      // Un membre non éligible voit son panier refusé globalement sans modification d'état.
+      this.assertEligibleInternal(memberId, now);
+
       const results: CartConfirmationItemResult[] = [];
-      let borrowedCount = 0;
+      let heldCount = 0;
       let reservedCount = 0;
       let refusedCount = 0;
 
@@ -2149,72 +3184,173 @@ export class LibraryService {
           continue;
         }
 
-        if (!eligibility.eligible) {
+        if (Boolean(item.bookArchived)) {
           refusedCount++;
           results.push({
             bookId: item.bookId,
             bookTitle: item.bookTitle,
             outcome: 'refuse',
-            code: eligibility.reasonCode,
-            message: eligibility.reasonMessage,
+            code: 'BOOK_ARCHIVED',
+            message: 'Cet ouvrage est archivé et ne peut pas être demandé.',
           });
           continue;
         }
 
-        try {
-          const loan = this.borrowBookInternal(memberId, item.bookId, now, null, {
-            id: memberId,
-            role: 'membre',
-          });
-          borrowedCount++;
-          this.db.prepare(`DELETE FROM cart_items WHERE id = ?`).run(item.id);
+        const activeLoan = this.db
+          .prepare(
+            `SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`
+          )
+          .get(memberId, item.bookId);
+        if (activeLoan) {
+          refusedCount++;
           results.push({
             bookId: item.bookId,
             bookTitle: item.bookTitle,
-            outcome: 'emprunt_enregistre',
-            message: `Emprunt enregistré pour 7 jours (exemplaire ${loan.copyBarcode}).`,
-            loan,
+            outcome: 'refuse',
+            code: 'DUPLICATE_ACTIVE_LOAN',
+            message: 'Refusé : vous détenez déjà un exemplaire actif de cet ouvrage.',
           });
-        } catch (err) {
-          if (err instanceof DomainError && err.code === 'NO_AVAILABLE_COPY') {
-            try {
-              const reservation = this.reserveBookInternal(memberId, item.bookId, now, {
-                id: memberId,
-                role: 'membre',
-              });
-              reservedCount++;
-              this.db.prepare(`DELETE FROM cart_items WHERE id = ?`).run(item.id);
-              results.push({
-                bookId: item.bookId,
-                bookTitle: item.bookTitle,
-                outcome: 'reservation_enregistree',
-                message: `Aucun exemplaire libre : réservation FIFO #${reservation.queuePosition ?? 1} enregistrée. Aucune date de disponibilité n'est garantie.`,
-                reservation,
-              });
-            } catch (resErr) {
-              refusedCount++;
-              results.push({
-                bookId: item.bookId,
-                bookTitle: item.bookTitle,
-                outcome: 'refuse',
-                code: resErr instanceof DomainError ? resErr.code : 'RESERVATION_REFUSED',
-                message:
-                  resErr instanceof Error
-                    ? resErr.message
-                    : 'Impossible d’enregistrer la réservation.',
-              });
-            }
-          } else {
+          continue;
+        }
+
+        const existingReq = this.db
+          .prepare(
+            `SELECT id, status FROM reservations
+             WHERE memberId = ? AND bookId = ? AND status IN ('En attente', 'Retenu 24h', 'Exemplaire attribué', 'Disponible pour retrait')`
+          )
+          .get(memberId, item.bookId) as { id: string; status: string } | undefined;
+        if (existingReq) {
+          refusedCount++;
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'refuse',
+            code: 'DUPLICATE_RESERVATION',
+            message:
+              existingReq.status === 'Retenu 24h'
+                ? 'Refusé : vous avez déjà une retenue 24 h active pour cet ouvrage.'
+                : 'Refusé : vous avez déjà une réservation active pour cet ouvrage.',
+          });
+          continue;
+        }
+
+        const pendingFifoRow = this.db
+          .prepare(
+            `SELECT COUNT(*) as cnt FROM reservations WHERE bookId = ? AND status = 'En attente'`
+          )
+          .get(item.bookId) as { cnt: number };
+
+        const availableCopy = this.db
+          .prepare(
+            `SELECT id, barcode FROM copies
+             WHERE bookId = ?
+               AND status = 'Disponible'
+               AND needsInspection = 0
+               AND physicalCondition NOT IN ('Endommagé', 'Hors service')
+             ORDER BY barcode ASC
+             LIMIT 1`
+          )
+          .get(item.bookId) as { id: string; barcode: string } | undefined;
+
+        if (availableCopy && pendingFifoRow.cnt === 0) {
+          const lockResult = this.db
+            .prepare(
+              `UPDATE copies
+               SET status = 'Retenu 24h', location = 'Banque d’accueil · Retrait 24h'
+               WHERE id = ? AND status = 'Disponible' AND needsInspection = 0`
+            )
+            .run(availableCopy.id);
+
+          if (lockResult.changes !== 1) {
             refusedCount++;
             results.push({
               bookId: item.bookId,
               bookTitle: item.bookTitle,
               outcome: 'refuse',
-              code: err instanceof DomainError ? err.code : 'REQUEST_REFUSED',
-              message:
-                err instanceof Error ? err.message : 'Demande refusée lors de la vérification serveur.',
+              code: 'COPY_RACE_CONFLICT',
+              message: 'Conflit concurrent sur cet exemplaire : veuillez réessayer.',
             });
+            continue;
           }
+
+          const reservationId = this.generateId('res');
+          const nowIso = now.toISOString();
+          const pickupDeadline = addHoursIso(now, HOLD_DURATION_HOURS);
+
+          this.db
+            .prepare(
+              `INSERT INTO reservations (id, memberId, bookId, requestType, requestedAt, queuePosition, status, assignedCopyId, availableAt, pickupDeadline, completedAt)
+               VALUES (?, ?, ?, 'retenue_24h', ?, NULL, 'Retenu 24h', ?, ?, ?, NULL)`
+            )
+            .run(reservationId, memberId, item.bookId, nowIso, availableCopy.id, nowIso, pickupDeadline);
+
+          this.insertCopyStateLogInternal(
+            {
+              copyId: availableCopy.id,
+              copyBarcode: availableCopy.barcode,
+              bookId: item.bookId,
+              bookTitle: item.bookTitle,
+              oldStatus: 'Disponible',
+              newStatus: 'Retenu 24h',
+              memberId,
+              agent: { id: memberId, role: 'membre' },
+              requestOrLoanId: reservationId,
+              summary: `Retenue 24 h créée lors de la validation du panier (expiration le ${formatFrenchDateTime(pickupDeadline)}).`,
+            },
+            now
+          );
+
+          this.insertNotificationInternal(
+            memberId,
+            'Retenue 24 h créée — À retirer au comptoir',
+            `Votre demande pour « ${item.bookTitle} » est acceptée. Un exemplaire vous est retenu pendant 24 h au comptoir, jusqu’au ${formatFrenchDateTime(pickupDeadline)}. Présentez votre carte membre pour le retrait.`,
+            'retrait',
+            now
+          );
+
+          heldCount++;
+          this.db.prepare(`DELETE FROM cart_items WHERE id = ?`).run(item.id);
+          const reservation = this.getReservationByIdInternal(reservationId, true)!;
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'retenue_24h_creee',
+            message: `Demande acceptée : à retirer au comptoir avant le ${formatFrenchDateTime(pickupDeadline)} (retenue 24 h).`,
+            reservation,
+          });
+          continue;
+        }
+
+        // Sinon (aucune copie libre ou file FIFO prioritaire existante) -> tenter réservation FIFO
+        try {
+          const reservation = this.reserveBookInternal(
+            memberId,
+            item.bookId,
+            now,
+            { id: memberId, role: 'membre' },
+            { hideBarcode: true }
+          );
+          reservedCount++;
+          this.db.prepare(`DELETE FROM cart_items WHERE id = ?`).run(item.id);
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'reservation_enregistree',
+            message: `Réservation FIFO enregistrée (rang n° ${reservation.queuePosition ?? 1}). Aucune date de disponibilité n’est promise.`,
+            reservation,
+          });
+        } catch (resErr) {
+          refusedCount++;
+          results.push({
+            bookId: item.bookId,
+            bookTitle: item.bookTitle,
+            outcome: 'refuse',
+            code: resErr instanceof DomainError ? resErr.code : 'RESERVATION_REFUSED',
+            message:
+              resErr instanceof Error
+                ? resErr.message
+                : 'Impossible d’enregistrer la demande pour cet ouvrage.',
+          });
         }
       }
 
@@ -2223,7 +3359,7 @@ export class LibraryService {
         'CART_CONFIRMED',
         'cart',
         memberId,
-        `Confirmation du panier : ${borrowedCount} emprunt(s), ${reservedCount} réservation(s), ${refusedCount} refus.`,
+        `Confirmation du panier : ${heldCount} retenue(s) 24 h, ${reservedCount} réservation(s) FIFO, ${refusedCount} refus.`,
         now
       );
 
@@ -2238,6 +3374,444 @@ export class LibraryService {
     });
 
     return tx.immediate();
+  }
+
+  // --- Comptoir / Circulation (scannage carte membre & code-barres exemplaire, réservé au personnel) ---
+
+  public searchMembersAtCounter(query: string): UserPublic[] {
+    const q = query.trim();
+    if (!q) {
+      return [];
+    }
+    const like = `%${q}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+         FROM users
+         WHERE LOWER(id) = LOWER(?)
+            OR LOWER(COALESCE(cne, '')) = LOWER(?)
+            OR LOWER(email) = LOWER(?)
+            OR fullName LIKE ?
+            OR email LIKE ?
+            OR COALESCE(cne, '') LIKE ?
+         ORDER BY CASE WHEN LOWER(COALESCE(cne, '')) = LOWER(?) OR LOWER(email) = LOWER(?) OR LOWER(id) = LOWER(?) THEN 0 ELSE 1 END,
+                  fullName ASC
+         LIMIT 15`
+      )
+      .all(q, q, q, like, like, like, q, q, q) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => this.mapUserPublicRow(r));
+  }
+
+  public lookupMemberAtCounter(query: string, now: Date = new Date()): CounterMemberDossier {
+    this.processDeadlines(now);
+    const q = query.trim();
+    if (!q) {
+      throw new DomainError(
+        'Veuillez scanner ou saisir une carte membre (CNE, e-mail académique ou identifiant).',
+        400,
+        'MEMBER_QUERY_REQUIRED'
+      );
+    }
+
+    const exactRow = this.db
+      .prepare(
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+         FROM users
+         WHERE LOWER(id) = LOWER(?)
+            OR LOWER(COALESCE(cne, '')) = LOWER(?)
+            OR LOWER(email) = LOWER(?)
+         LIMIT 1`
+      )
+      .get(q, q, q) as Record<string, unknown> | undefined;
+
+    let userRow = exactRow;
+    if (!userRow) {
+      const like = `%${q}%`;
+      const matches = this.db
+        .prepare(
+          `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+           FROM users
+           WHERE fullName LIKE ? OR email LIKE ? OR COALESCE(cne, '') LIKE ?
+           ORDER BY fullName ASC
+           LIMIT 5`
+        )
+        .all(like, like, like) as Array<Record<string, unknown>>;
+
+      if (matches.length === 0) {
+        throw new DomainError(
+          `Aucun membre trouvé pour la carte ou recherche « ${q} ».`,
+          404,
+          'MEMBER_NOT_FOUND'
+        );
+      }
+      if (matches.length > 1) {
+        throw new DomainError(
+          `Plusieurs comptes correspondent à « ${q} ». Précisez le CNE ou sélectionnez le membre dans la liste.`,
+          409,
+          'AMBIGUOUS_MEMBER_QUERY'
+        );
+      }
+      userRow = matches[0];
+    }
+
+    return this.buildCounterMemberDossierInternal(userRow, now);
+  }
+
+  private buildCounterMemberDossierInternal(
+    userRow: Record<string, unknown>,
+    now: Date
+  ): CounterMemberDossier {
+    const member = this.mapUserPublicRow(userRow);
+    const eligibility = this.checkEligibility(member.id, now);
+
+    const reservationRows = this.db
+      .prepare(
+        `SELECT r.*, b.title as bookTitle, b.authors as bookAuthors, b.coverImage as bookCoverImage,
+                b.shelfLocation as shelfLocation, c.barcode as assignedCopyBarcode
+         FROM reservations r
+         JOIN books b ON b.id = r.bookId
+         LEFT JOIN copies c ON c.id = r.assignedCopyId
+         WHERE r.memberId = ?
+         ORDER BY r.requestedAt ASC`
+      )
+      .all(member.id) as Array<Record<string, unknown>>;
+
+    const mappedRes = reservationRows.map((r) => this.mapReservationRow(r, false, false));
+    const holds24h = mappedRes.filter((r) => r.status === 'Retenu 24h');
+    const fifoReadyPickups = mappedRes.filter((r) => r.status === 'Disponible pour retrait');
+    const fifoWaiting = mappedRes.filter((r) => r.status === 'En attente');
+
+    const loans = this.getMemberLoans(member.id, now);
+    const activeLoans = loans.filter((l) => l.status !== 'Retourné');
+    const pastLoans = loans.filter((l) => l.status === 'Retourné');
+
+    return {
+      member,
+      eligibility,
+      holds24h,
+      fifoReadyPickups,
+      fifoWaiting,
+      activeLoans,
+      pastLoans,
+    };
+  }
+
+  public checkoutCopyAtCounter(
+    memberId: string,
+    barcodeInput: string,
+    actor: AuditActor,
+    now: Date = new Date()
+  ): CounterPickupResult {
+    const tx = this.db.transaction(() => {
+      this.syncOverdueLoansInternal(now);
+      this.expireOverdueReservationsInternal(now);
+
+      const barcode = barcodeInput.trim();
+      if (!barcode) {
+        throw new DomainError(
+          'Veuillez scanner ou saisir le code-barres de l’exemplaire physique.',
+          400,
+          'BARCODE_REQUIRED'
+        );
+      }
+
+      const memberRow = this.db
+        .prepare(
+          `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+           FROM users WHERE id = ?`
+        )
+        .get(memberId) as Record<string, unknown> | undefined;
+
+      if (!memberRow) {
+        throw new DomainError('Membre introuvable.', 404, 'USER_NOT_FOUND');
+      }
+
+      // Vérifie l'éligibilité au moment du retrait au comptoir sans modifier l'état en cas de blocage
+      this.assertEligibleInternal(memberId, now);
+
+      const copyRow = this.db
+        .prepare(
+          `SELECT c.*, b.title as bookTitle, b.archived as bookArchived
+           FROM copies c
+           JOIN books b ON b.id = c.bookId
+           WHERE LOWER(c.barcode) = LOWER(?)`
+        )
+        .get(barcode) as
+        | (Record<string, unknown> & { bookTitle: string; bookArchived: number })
+        | undefined;
+
+      if (!copyRow) {
+        throw new DomainError(
+          `Aucun exemplaire physique enregistré avec le code-barres « ${barcode} ».`,
+          404,
+          'COPY_NOT_FOUND'
+        );
+      }
+
+      const copyId = String(copyRow.id);
+      const copyBookId = String(copyRow.bookId);
+      const copyStatus = copyRow.status as CopyStatus;
+
+      if (Boolean(copyRow.bookArchived)) {
+        throw new DomainError(
+          `L’ouvrage « ${copyRow.bookTitle} » est archivé.`,
+          409,
+          'BOOK_ARCHIVED'
+        );
+      }
+
+      const matchingRequest = this.db
+        .prepare(
+          `SELECT * FROM reservations
+           WHERE memberId = ?
+             AND assignedCopyId = ?
+             AND status IN ('Retenu 24h', 'Disponible pour retrait')
+           LIMIT 1`
+        )
+        .get(memberId, copyId) as Record<string, unknown> | undefined;
+
+      if (!matchingRequest) {
+        const otherHolder = this.db
+          .prepare(
+            `SELECT r.id, r.status, u.fullName as holderName
+             FROM reservations r
+             JOIN users u ON u.id = r.memberId
+             WHERE r.assignedCopyId = ? AND r.status IN ('Retenu 24h', 'Disponible pour retrait')
+             LIMIT 1`
+          )
+          .get(copyId) as { id: string; status: string; holderName: string } | undefined;
+
+        if (otherHolder) {
+          throw new DomainError(
+            `Retrait refusé : l’exemplaire ${String(copyRow.barcode)} est actuellement réservé/retenu pour un autre membre (${otherHolder.holderName}). Aucun état n’a été modifié.`,
+            409,
+            'COPY_ASSIGNED_TO_OTHER_MEMBER'
+          );
+        }
+
+        const memberBookRequest = this.db
+          .prepare(
+            `SELECT r.id, r.status, c.barcode as expectedBarcode
+             FROM reservations r
+             LEFT JOIN copies c ON c.id = r.assignedCopyId
+             WHERE r.memberId = ?
+               AND r.bookId = ?
+               AND r.status IN ('Retenu 24h', 'Disponible pour retrait')
+             LIMIT 1`
+          )
+          .get(memberId, copyBookId) as
+          | { id: string; status: string; expectedBarcode: string | null }
+          | undefined;
+
+        if (memberBookRequest && memberBookRequest.expectedBarcode) {
+          throw new DomainError(
+            `Mauvais exemplaire scanné pour « ${copyRow.bookTitle} » : la demande du membre porte sur l’exemplaire ${memberBookRequest.expectedBarcode}, pas sur ${String(copyRow.barcode)}.`,
+            409,
+            'WRONG_COPY_FOR_REQUEST'
+          );
+        }
+
+        if (copyStatus !== 'Disponible') {
+          throw new DomainError(
+            `Retrait refusé : l’exemplaire ${String(copyRow.barcode)} est au statut « ${copyStatus} » et ne correspond à aucune demande prête pour ce membre.`,
+            409,
+            'COPY_NOT_AVAILABLE'
+          );
+        }
+
+        throw new DomainError(
+          `Retrait refusé : aucune retenue 24 h ni réservation FIFO prête à retirer n’existe pour ce membre sur l’exemplaire ${String(copyRow.barcode)}. Le membre doit d’abord valider sa demande depuis son panier.`,
+          409,
+          'NO_MATCHING_REQUEST_FOR_COPY'
+        );
+      }
+
+      const activeSameBookLoan = this.db
+        .prepare(
+          `SELECT id FROM loans WHERE memberId = ? AND bookId = ? AND status != 'Retourné'`
+        )
+        .get(memberId, copyBookId);
+      if (activeSameBookLoan) {
+        throw new DomainError(
+          'Ce membre détient déjà un emprunt actif pour cet ouvrage.',
+          409,
+          'DUPLICATE_ACTIVE_LOAN'
+        );
+      }
+
+      if (copyStatus !== 'Retenu 24h' && copyStatus !== 'Réservé') {
+        throw new DomainError(
+          `Incohérence d’état détectée : l’exemplaire ${String(copyRow.barcode)} est au statut « ${copyStatus} ».`,
+          409,
+          'INVALID_COPY_STATE'
+        );
+      }
+
+      const requestId = String(matchingRequest.id);
+      const reqStatus = String(matchingRequest.status);
+      const settings = this.getSettings();
+      const nowIso = now.toISOString();
+      const dueAt = addDaysIso(now, settings.borrowingDurationDays);
+      const loanId = this.generateId('ln');
+
+      this.db
+        .prepare(
+          `UPDATE reservations
+           SET status = 'Retirée', completedAt = ?
+           WHERE id = ?`
+        )
+        .run(nowIso, requestId);
+
+      this.db
+        .prepare(
+          `UPDATE copies SET status = 'Emprunté', location = 'En prêt membre' WHERE id = ?`
+        )
+        .run(copyId);
+
+      this.db
+        .prepare(
+          `INSERT INTO loans (id, memberId, copyId, bookId, borrowedAt, dueAt, returnedAt, returnCondition, returnNotes, status)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'En cours')`
+        )
+        .run(loanId, memberId, copyId, copyBookId, nowIso, dueAt);
+
+      this.insertCopyStateLogInternal(
+        {
+          copyId,
+          copyBarcode: String(copyRow.barcode),
+          bookId: copyBookId,
+          bookTitle: copyRow.bookTitle,
+          oldStatus: copyStatus,
+          newStatus: 'Emprunté',
+          memberId,
+          memberName: String(memberRow.fullName),
+          agent: actor,
+          requestOrLoanId: loanId,
+          summary: `Retrait validé au comptoir par scan carte + code-barres (${reqStatus === 'Retenu 24h' ? 'retenue 24 h' : 'réservation FIFO'}). Prêt ${settings.borrowingDurationDays} j jusqu’au ${formatFrenchDateTime(dueAt)}.`,
+        },
+        now
+      );
+
+      this.insertNotificationInternal(
+        memberId,
+        'Emprunt remis au comptoir',
+        `Votre emprunt de « ${copyRow.bookTitle} » (exemplaire ${String(copyRow.barcode)}) a été validé au comptoir. Date limite de retour : ${formatFrenchDateTime(dueAt)}.`,
+        'emprunt',
+        now
+      );
+
+      this.insertAuditLogInternal(
+        actor,
+        'COUNTER_PICKUP_VALIDATED',
+        'loan',
+        loanId,
+        `Retrait comptoir validé par ${actor.fullName || actor.id || 'bibliothécaire'} : membre ${String(memberRow.fullName)} + exemplaire ${String(copyRow.barcode)} (« ${copyRow.bookTitle} »). Échéance : ${formatFrenchDateTime(dueAt)}.`,
+        now
+      );
+
+      const loan = this.getLoanByIdInternal(loanId)!;
+      const fulfilledRequest = this.getReservationByIdInternal(requestId, false)!;
+      const dossier = this.buildCounterMemberDossierInternal(memberRow, now);
+
+      return {
+        loan,
+        fulfilledRequest,
+        dossier,
+      };
+    });
+
+    return tx.immediate();
+  }
+
+  public lookupCopyForReturnAtCounter(
+    barcodeInput: string,
+    now: Date = new Date()
+  ): CounterReturnLookup {
+    this.syncOverdueLoansInternal(now);
+    const barcode = barcodeInput.trim();
+    if (!barcode) {
+      throw new DomainError(
+        'Veuillez scanner ou saisir un code-barres d’exemplaire.',
+        400,
+        'BARCODE_REQUIRED'
+      );
+    }
+
+    const c = this.db
+      .prepare(
+        `SELECT c.*, b.title as bookTitle
+         FROM copies c
+         JOIN books b ON b.id = c.bookId
+         WHERE LOWER(c.barcode) = LOWER(?)`
+      )
+      .get(barcode) as (Record<string, unknown> & { bookTitle: string }) | undefined;
+
+    if (!c) {
+      throw new DomainError(
+        `Aucun exemplaire enregistré pour le code-barres « ${barcode} ».`,
+        404,
+        'COPY_NOT_FOUND'
+      );
+    }
+
+    const loanRow = this.db
+      .prepare(
+        `SELECT l.*, b.title as bookTitle, b.authors as bookAuthors, b.coverImage as bookCoverImage,
+                b.shelfLocation as shelfLocation, c.barcode as copyBarcode,
+                u.fullName as memberName, u.email as memberEmail, u.cne as memberCne
+         FROM loans l
+         JOIN books b ON b.id = l.bookId
+         JOIN copies c ON c.id = l.copyId
+         JOIN users u ON u.id = l.memberId
+         WHERE l.copyId = ? AND l.status != 'Retourné'
+         ORDER BY l.borrowedAt DESC
+         LIMIT 1`
+      )
+      .get(String(c.id)) as Record<string, unknown> | undefined;
+
+    return {
+      copy: {
+        id: String(c.id),
+        bookId: String(c.bookId),
+        barcode: String(c.barcode),
+        status: c.status as CopyStatus,
+        physicalCondition: c.physicalCondition as PhysicalCondition,
+        location: String(c.location),
+        needsInspection: Boolean(c.needsInspection),
+        createdAt: String(c.createdAt),
+        bookTitle: String(c.bookTitle),
+      },
+      activeLoan: loanRow ? this.mapLoanRow(loanRow, true) : null,
+    };
+  }
+
+  public getCopyStateLogsAdmin(limit = 100): CopyStateLogRecord[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM copy_state_logs
+         ORDER BY createdAt DESC, rowid DESC
+         LIMIT ?`
+      )
+      .all(safeLimit) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      id: String(row.id),
+      copyId: String(row.copyId),
+      copyBarcode: String(row.copyBarcode),
+      bookId: String(row.bookId),
+      bookTitle: String(row.bookTitle),
+      oldStatus: row.oldStatus ? (String(row.oldStatus) as CopyStatus) : null,
+      newStatus: String(row.newStatus) as CopyStatus,
+      memberId: row.memberId ? String(row.memberId) : null,
+      memberName: row.memberName ? String(row.memberName) : null,
+      agentId: row.agentId ? String(row.agentId) : null,
+      agentName: row.agentName ? String(row.agentName) : null,
+      requestOrLoanId: row.requestOrLoanId ? String(row.requestOrLoanId) : null,
+      summary: String(row.summary),
+      createdAt: String(row.createdAt),
+    }));
   }
 
   public getAuditLogsAdmin(limit = 100): AuditLogRecord[] {
@@ -2294,7 +3868,10 @@ export class LibraryService {
     return r ? this.mapLoanRow(r, false) : null;
   }
 
-  private getReservationByIdInternal(reservationId: string): ReservationRecord | null {
+  private getReservationByIdInternal(
+    reservationId: string,
+    hideBarcode = false
+  ): ReservationRecord | null {
     const r = this.db
       .prepare(
         `SELECT r.*, b.title as bookTitle, b.authors as bookAuthors, b.coverImage as bookCoverImage,
@@ -2305,7 +3882,7 @@ export class LibraryService {
          WHERE r.id = ?`
       )
       .get(reservationId) as Record<string, unknown> | undefined;
-    return r ? this.mapReservationRow(r, false) : null;
+    return r ? this.mapReservationRow(r, false, hideBarcode) : null;
   }
 
   private mapLoanRow(r: Record<string, unknown>, includeMemberPii: boolean): LoanRecord {
@@ -2338,16 +3915,18 @@ export class LibraryService {
 
   private mapReservationRow(
     r: Record<string, unknown>,
-    includeMemberPii: boolean
+    includeMemberPii: boolean,
+    hideBarcode = false
   ): ReservationRecord {
     const base: ReservationRecord = {
       id: String(r.id),
       memberId: String(r.memberId),
       bookId: String(r.bookId),
+      requestType: (r.requestType ? String(r.requestType) : 'reservation_fifo') as RequestType,
       requestedAt: String(r.requestedAt),
       queuePosition: r.queuePosition !== null && r.queuePosition !== undefined ? Number(r.queuePosition) : null,
       status: r.status as ReservationRecord['status'],
-      assignedCopyId: r.assignedCopyId ? String(r.assignedCopyId) : null,
+      assignedCopyId: hideBarcode ? null : r.assignedCopyId ? String(r.assignedCopyId) : null,
       availableAt: r.availableAt ? String(r.availableAt) : null,
       pickupDeadline: r.pickupDeadline ? String(r.pickupDeadline) : null,
       completedAt: r.completedAt ? String(r.completedAt) : null,
@@ -2355,7 +3934,8 @@ export class LibraryService {
       bookAuthors: String(r.bookAuthors),
       bookCoverImage: String(r.bookCoverImage),
       shelfLocation: String(r.shelfLocation),
-      assignedCopyBarcode: r.assignedCopyBarcode ? String(r.assignedCopyBarcode) : null,
+      assignedCopyBarcode:
+        hideBarcode || !r.assignedCopyBarcode ? null : String(r.assignedCopyBarcode),
     };
 
     if (includeMemberPii) {

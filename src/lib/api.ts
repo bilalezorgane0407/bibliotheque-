@@ -7,17 +7,26 @@ import type {
   CartConfirmationResponse,
   CartItemRecord,
   Copy,
+  CopyStateLogRecord,
   CopyStatus,
+  CounterMemberDossier,
+  CounterPickupResult,
+  CounterReturnLookup,
   DashboardStats,
+  DemoState,
   EligibilityReport,
   GoogleAuthStatus,
+  LibrarySettings,
   LoanRecord,
   NotificationRecord,
+  OverdueNotificationResult,
   PhysicalCondition,
   ReservationRecord,
   ReturnInspectionOutcome,
+  SimulatedEmailRecord,
   StudentStatus,
   UserPublic,
+  UserRole,
 } from '../../shared/types.ts';
 
 export class ApiError extends Error {
@@ -81,6 +90,9 @@ export const api = {
       eligibility: EligibilityReport;
       googleAuth: GoogleAuthStatus;
       demoModeEnabled: boolean;
+      isDemoSession?: boolean;
+      simulatedNow?: string;
+      settings?: LibrarySettings;
     }>('/api/auth/me'),
 
   getGoogleAuthUrl: () =>
@@ -97,22 +109,105 @@ export const api = {
       body: JSON.stringify({ handoffToken }),
     }),
 
+  completeFirebaseGoogleLogin: (payload: {
+    idToken?: string;
+    accessToken?: string | null;
+  }) =>
+    request<{
+      authenticated: boolean;
+      user: UserPublic;
+      eligibility: EligibilityReport;
+      requiresLibrarianValidation?: boolean;
+    }>('/api/auth/google/firebase', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  registerAcademic: (payload: {
+    fullName: string;
+    email: string;
+    password: string;
+    filiere?: string;
+    cne?: string;
+    demoMode?: boolean;
+  }) =>
+    request<{
+      user: UserPublic;
+      emailVerificationRequired: boolean;
+      expiresAt: string;
+      emailDispatched: boolean;
+      demoVerificationCode?: string;
+      message: string;
+    }>('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  verifyEmailCode: (payload: { email: string; code: string; demoMode?: boolean }) =>
+    request<{
+      authenticated: boolean;
+      user: UserPublic;
+      eligibility: EligibilityReport;
+      isDemoSession?: boolean;
+      message: string;
+    }>('/api/auth/verify-email', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  resendVerificationCode: (payload: { email: string; demoMode?: boolean }) =>
+    request<{
+      ok: boolean;
+      email: string;
+      expiresAt: string;
+      demoVerificationCode?: string;
+    }>('/api/auth/resend-verification', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
   demoLogin: (userId: string) =>
-    request<{ authenticated: boolean; user: UserPublic; eligibility: EligibilityReport }>(
-      '/api/auth/demo-login',
-      {
-        method: 'POST',
-        body: JSON.stringify({ userId }),
-      }
-    ),
+    request<{
+      authenticated: boolean;
+      user: UserPublic;
+      eligibility: EligibilityReport;
+      isDemoSession?: boolean;
+      simulatedNow?: string;
+    }>('/api/auth/demo-login', {
+      method: 'POST',
+      body: JSON.stringify({ userId }),
+    }),
 
   login: (email: string, password: string) =>
-    request<{ user: UserPublic; eligibility: EligibilityReport }>('/api/auth/login', {
+    request<{
+      user: UserPublic;
+      eligibility: EligibilityReport;
+      isDemoSession?: boolean;
+    }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
     }),
 
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+
+  // Bac à sable Mode Démo
+  getDemoState: () => request<DemoState>('/api/demo/state'),
+
+  demoReset: () =>
+    request<DemoState>('/api/demo/reset', {
+      method: 'POST',
+    }),
+
+  demoAdvanceClock: (payload: {
+    addHours?: number;
+    setOffsetHours?: number;
+    addDays?: number;
+    setOffsetDays?: number;
+  }) =>
+    request<DemoState & { expiredReservationsCount: number }>('/api/demo/clock', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   listBooks: (params?: {
     search?: string;
@@ -191,7 +286,7 @@ export const api = {
   confirmCart: () =>
     request<CartConfirmationResponse>('/api/cart/confirm', { method: 'POST' }),
 
-  // Administration bibliothécaire
+  // Administration bibliothécaire & administrateur
   adminGetStats: () => request<{ stats: DashboardStats }>('/api/admin/stats'),
 
   adminGetBooks: () => request<{ books: BookWithStats[] }>('/api/admin/books'),
@@ -221,6 +316,23 @@ export const api = {
       `/api/admin/books/${encodeURIComponent(bookId)}/copies`,
       { method: 'POST', body: JSON.stringify(payload) }
     ),
+
+  adminRegisterCopiesBatch: (
+    bookId: string,
+    payload: {
+      barcodes: string[] | string;
+      physicalCondition: PhysicalCondition;
+      location: string;
+    }
+  ) =>
+    request<{
+      created: Copy[];
+      skippedBarcodes: string[];
+      assignedReservationsCount: number;
+    }>(`/api/admin/books/${encodeURIComponent(bookId)}/copies/batch`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   adminUpdateCopyStatus: (
     copyId: string,
@@ -257,6 +369,12 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  adminToggleLoanOverdueTest: (loanId: string) =>
+    request<{ loan: LoanRecord }>(
+      `/api/admin/loans/${encodeURIComponent(loanId)}/toggle-overdue-test`,
+      { method: 'POST' }
+    ),
+
   adminReturnLoan: (
     loanId: string,
     payload: {
@@ -269,6 +387,25 @@ export const api = {
       `/api/admin/loans/${encodeURIComponent(loanId)}/return`,
       { method: 'POST', body: JSON.stringify(payload) }
     ),
+
+  adminNotifyOverdueMembers: (payload?: { googleAccessToken?: string }) =>
+    request<OverdueNotificationResult>('/api/admin/loans/notify-overdue', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
+
+  adminSendTestEmail: (payload?: { googleAccessToken?: string; recipientEmail?: string }) =>
+    request<{
+      ok: boolean;
+      demoSimulated: boolean;
+      recipientEmail: string;
+      transport?: string;
+      record?: SimulatedEmailRecord;
+      message: string;
+    }>('/api/admin/email/test', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
 
   adminGetReservations: () =>
     request<{ reservations: ReservationRecord[] }>('/api/admin/reservations'),
@@ -314,6 +451,46 @@ export const api = {
       { method: 'PATCH', body: JSON.stringify({ studentStatus, accountStatus }) }
     ),
 
+  adminUpdateMemberRole: (userId: string, role: UserRole, isAdmin: boolean) =>
+    request<{ member: UserPublic }>(
+      `/api/admin/members/${encodeURIComponent(userId)}/role`,
+      { method: 'PATCH', body: JSON.stringify({ role, isAdmin }) }
+    ),
+
+  adminGetSettings: () => request<{ settings: LibrarySettings }>('/api/admin/settings'),
+
+  adminUpdateSettings: (patch: Partial<LibrarySettings>) =>
+    request<{ settings: LibrarySettings }>('/api/admin/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  // Comptoir & Circulation (scan carte membre & code-barres exemplaire, réservé au personnel)
+  adminSearchCounterMembers: (q: string) =>
+    request<{ members: UserPublic[] }>(
+      `/api/admin/counter/members/search?q=${encodeURIComponent(q)}`
+    ),
+
+  adminLookupCounterMember: (q: string) =>
+    request<{ dossier: CounterMemberDossier }>(
+      `/api/admin/counter/member?q=${encodeURIComponent(q)}`
+    ),
+
+  adminCounterCheckout: (memberId: string, barcode: string) =>
+    request<CounterPickupResult>('/api/admin/counter/checkout', {
+      method: 'POST',
+      body: JSON.stringify({ memberId, barcode }),
+    }),
+
+  adminCounterScanReturn: (barcode: string) =>
+    request<CounterReturnLookup>('/api/admin/counter/scan-return', {
+      method: 'POST',
+      body: JSON.stringify({ barcode }),
+    }),
+
+  adminGetCopyStateLogs: (limit = 100) =>
+    request<{ logs: CopyStateLogRecord[] }>(`/api/admin/copy-state-logs?limit=${limit}`),
+
   adminGetAuditLogs: (limit = 100) =>
     request<{ logs: AuditLogRecord[] }>(`/api/admin/audit-logs?limit=${limit}`),
 };
@@ -338,8 +515,12 @@ export function formatDateTimeFr(iso: string | null | undefined): string {
   }).format(new Date(iso));
 }
 
-export function daysRemainingFromNow(iso: string | null | undefined): number | null {
+export function daysRemainingFromNow(
+  iso: string | null | undefined,
+  referenceNowIso?: string | null
+): number | null {
   if (!iso) return null;
-  const diffMs = new Date(iso).getTime() - Date.now();
+  const baseMs = referenceNowIso ? new Date(referenceNowIso).getTime() : Date.now();
+  const diffMs = new Date(iso).getTime() - baseMs;
   return Math.ceil(diffMs / (24 * 60 * 60 * 1000));
 }

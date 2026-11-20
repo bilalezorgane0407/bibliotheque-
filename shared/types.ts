@@ -8,6 +8,7 @@ export type AuthSource = 'local' | 'usmba_sso' | 'google_oidc';
 
 export type CopyStatus =
   | 'Disponible'
+  | 'Retenu 24h'
   | 'Emprunté'
   | 'Réservé'
   | 'En réparation'
@@ -22,8 +23,11 @@ export type PhysicalCondition =
 
 export type LoanStatus = 'En cours' | 'Retourné' | 'En retard';
 
+export type RequestType = 'retenue_24h' | 'reservation_fifo';
+
 export type ReservationStatus =
   | 'En attente'
+  | 'Retenu 24h'
   | 'Exemplaire attribué'
   | 'Disponible pour retrait'
   | 'Retirée'
@@ -43,6 +47,8 @@ export interface UserPublic {
   institution: string;
   studentStatus: StudentStatus;
   accountStatus: AccountStatus;
+  emailVerified?: boolean;
+  isAdmin?: boolean;
   cne: string | null;
   filiere: string | null;
   authSource: AuthSource;
@@ -52,6 +58,7 @@ export interface UserPublic {
 
 export interface EligibilityReport {
   authenticated: boolean;
+  emailVerified: boolean;
   verifiedEstStudent: boolean;
   accountActive: boolean;
   noOverdueLoans: boolean;
@@ -60,8 +67,9 @@ export interface EligibilityReport {
   reasonCode:
     | 'ELIGIBLE'
     | 'AUTH_REQUIRED'
-    | 'ACCOUNT_SUSPENDED'
+    | 'EMAIL_NOT_VERIFIED'
     | 'EST_STATUS_NOT_VERIFIED'
+    | 'ACCOUNT_SUSPENDED'
     | 'OVERDUE_RETURN';
   reasonMessage: string;
 }
@@ -99,6 +107,7 @@ export interface Copy {
 export interface BookWithStats extends Book {
   totalCopies: number;
   availableCopies: number;
+  held24hCopies?: number;
   borrowedCopies: number;
   reservedCopies: number;
   repairCopies: number;
@@ -139,6 +148,7 @@ export interface ReservationRecord {
   id: string;
   memberId: string;
   bookId: string;
+  requestType: RequestType;
   requestedAt: string;
   queuePosition: number | null;
   status: ReservationStatus;
@@ -175,7 +185,7 @@ export interface CartItemRecord {
 }
 
 export type CartConfirmationOutcome =
-  | 'emprunt_enregistre'
+  | 'retenue_24h_creee'
   | 'reservation_enregistree'
   | 'refuse';
 
@@ -194,6 +204,44 @@ export interface CartConfirmationResponse {
   remainingCartCount: number;
 }
 
+export interface CopyStateLogRecord {
+  id: string;
+  copyId: string;
+  copyBarcode: string;
+  bookId: string;
+  bookTitle: string;
+  oldStatus: CopyStatus | null;
+  newStatus: CopyStatus;
+  memberId: string | null;
+  memberName: string | null;
+  agentId: string | null;
+  agentName: string | null;
+  requestOrLoanId: string | null;
+  summary: string;
+  createdAt: string;
+}
+
+export interface CounterMemberDossier {
+  member: UserPublic;
+  eligibility: EligibilityReport;
+  holds24h: ReservationRecord[];
+  fifoReadyPickups: ReservationRecord[];
+  fifoWaiting: ReservationRecord[];
+  activeLoans: LoanRecord[];
+  pastLoans: LoanRecord[];
+}
+
+export interface CounterPickupResult {
+  loan: LoanRecord;
+  fulfilledRequest: ReservationRecord;
+  dossier: CounterMemberDossier;
+}
+
+export interface CounterReturnLookup {
+  copy: Copy & { bookTitle: string };
+  activeLoan: LoanRecord | null;
+}
+
 export interface AuditLogRecord {
   id: string;
   actorId: string | null;
@@ -209,6 +257,7 @@ export interface AuditLogRecord {
 export interface GoogleAuthStatus {
   provider: string;
   configured: boolean;
+  firebaseAuthConfigured?: boolean;
   clientIdConfigured: boolean;
   redirectUri: string;
   sharedRedirectUri: string | null;
@@ -223,6 +272,7 @@ export interface DashboardStats {
   totalTitles: number;
   totalPhysicalCopies: number;
   availableCopies: number;
+  held24hCopies: number;
   borrowedCopies: number;
   reservedCopies: number;
   repairCopies: number;
@@ -234,6 +284,56 @@ export interface DashboardStats {
   activeLoans: number;
 }
 
+export interface OverdueEmailRecipient {
+  memberId: string;
+  memberName: string;
+  memberEmail: string;
+  books: Array<{ title: string; barcode: string; dueAt: string }>;
+  emailSent: boolean;
+}
+
+export interface OverdueNotificationResult {
+  notifiedMembersCount: number;
+  overdueLoansCount: number;
+  emailsSentCount: number;
+  smtpConfigured: boolean;
+  gmailApiUsed?: boolean;
+  demoSimulated?: boolean;
+  recipients: OverdueEmailRecipient[];
+  subject: string;
+  summaryMessage: string;
+}
+
+export interface LibrarySettings {
+  borrowingDurationDays: number;
+  pickupWindowDays: number;
+  maxQuantityPerTitle: number;
+  realEmailsEnabled: boolean;
+  testEmailRecipient: string;
+}
+
+export interface SimulatedEmailRecord {
+  id: string;
+  recipientEmail: string;
+  subject: string;
+  body: string;
+  category: 'verification' | 'rappel_retard' | 'retrait' | 'test';
+  createdAt: string;
+}
+
+export interface DemoState {
+  demoModeEnabled: boolean;
+  isDemoSession: boolean;
+  simulatedNow: string;
+  clockOffsetDays: number;
+  clockOffsetHours: number;
+  profiles: UserPublic[];
+  outbox: SimulatedEmailRecord[];
+  settings: LibrarySettings;
+}
+
+export type DemoScenarioStatus = 'a_verifier' | 'reussi' | 'echoue';
+
 export const EST_DEPARTMENTS = [
   'Génie Informatique',
   'Génie Électrique',
@@ -244,6 +344,7 @@ export const EST_DEPARTMENTS = [
 
 export const BOOK_LANGUAGES = ['Français', 'Anglais', 'Arabe'] as const;
 
+export const HOLD_DURATION_HOURS = 24;
 export const BORROWING_DURATION_DAYS = 7;
 export const PICKUP_WINDOW_DAYS = 3;
 export const MAX_QUANTITY_PER_TITLE = 1;

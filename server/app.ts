@@ -7,21 +7,25 @@ import {
   clearSessionCookie,
   hasSessionCookie,
   isHttpsRequest,
-  isCrossSiteIframeContext,
-  buildCookieOptions,
   type AuthenticatedRequest,
 } from './auth/session.ts';
 import { verifyPassword } from './auth/password.ts';
-import { googleAuthAdapter } from './auth/googleAuthAdapter.ts';
+import { GoogleAuthAdapter, googleAuthAdapter } from './auth/googleAuthAdapter.ts';
+import { resetDemoDatabase } from './db/database.ts';
 import { DomainError, LibraryService } from './services/libraryService.ts';
+import { isSmtpConfigured, sendEmailViaSmtp, sendEmailViaGmailApi } from './services/emailService.ts';
 import {
   MAX_QUANTITY_PER_TITLE,
   type AccountStatus,
   type CopyStatus,
+  type DemoState,
+  type LibrarySettings,
+  type OverdueNotificationResult,
   type PhysicalCondition,
   type ReturnInspectionOutcome,
   type StudentStatus,
   type UserPublic,
+  type UserRole,
 } from '../shared/types.ts';
 
 function getOAuthStateSecret(): string {
@@ -73,10 +77,115 @@ function renderOAuthPopupHtml(payload: Record<string, unknown>, fallbackText: st
 </html>`;
 }
 
-export function createApp(db: Database.Database, getNow: () => Date = () => new Date()) {
+function mapUserPublicRow(row: Record<string, unknown>): UserPublic {
+  return {
+    id: String(row.id),
+    fullName: String(row.fullName),
+    email: String(row.email),
+    role: row.role as UserPublic['role'],
+    institution: String(row.institution),
+    studentStatus: row.studentStatus as StudentStatus,
+    accountStatus: row.accountStatus as AccountStatus,
+    emailVerified: row.emailVerified === undefined ? true : Boolean(row.emailVerified),
+    isAdmin: Boolean(row.isAdmin),
+    cne: row.cne ? String(row.cne) : null,
+    filiere: row.filiere ? String(row.filiere) : null,
+    authSource: row.authSource as UserPublic['authSource'],
+    isDemo: Boolean(row.isDemo),
+    createdAt: String(row.createdAt),
+  };
+}
+
+export function createApp(
+  db: Database.Database,
+  getNow: () => Date = () => new Date(),
+  authAdapter: GoogleAuthAdapter = googleAuthAdapter,
+  demoDb?: Database.Database
+) {
   const app = express();
-  const service = new LibraryService(db);
-  const { attachUser, requireAuth, requireLibrarian } = createAuthMiddleware(db);
+  const realService = new LibraryService(db, { isDemoSandbox: false });
+  const activeDemoDb = demoDb || db;
+  const demoService = new LibraryService(activeDemoDb, { isDemoSandbox: true });
+
+  const isDemoModeEnabled = (): boolean => {
+    if (process.env.DISABLE_DEMO_MODE === 'true') return false;
+    if (process.env.NODE_ENV === 'production' && process.env.ENABLE_DEMO_IN_PROD !== 'true') {
+      return false;
+    }
+    return true;
+  };
+
+  const getDemoClockOffsetHours = (): number => {
+    try {
+      const hoursRow = activeDemoDb
+        .prepare(`SELECT value FROM demo_meta WHERE key = 'clock_offset_hours'`)
+        .get() as { value?: string } | undefined;
+      if (hoursRow?.value !== undefined) {
+        const parsedHours = Number(hoursRow.value);
+        if (Number.isFinite(parsedHours)) return parsedHours;
+      }
+      const daysRow = activeDemoDb
+        .prepare(`SELECT value FROM demo_meta WHERE key = 'clock_offset_days'`)
+        .get() as { value?: string } | undefined;
+      const parsedDays = Number(daysRow?.value ?? '0');
+      return Number.isFinite(parsedDays) ? parsedDays * 24 : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const getDemoNow = (): Date => {
+    const offsetHours = getDemoClockOffsetHours();
+    return new Date(getNow().getTime() + offsetHours * 60 * 60 * 1000);
+  };
+
+  const getContext = (req: AuthenticatedRequest) => {
+    const useDemo = Boolean(req.isDemoSession && isDemoModeEnabled());
+    return {
+      db: useDemo ? activeDemoDb : db,
+      service: useDemo ? demoService : realService,
+      now: useDemo ? getDemoNow() : getNow(),
+      isDemo: useDemo,
+    };
+  };
+
+  const buildDemoState = (req: AuthenticatedRequest): DemoState => {
+    const enabled = isDemoModeEnabled();
+    const clockOffsetHours = enabled ? getDemoClockOffsetHours() : 0;
+    const clockOffsetDays = Number((clockOffsetHours / 24).toFixed(2));
+    const simulatedNow = enabled ? getDemoNow().toISOString() : getNow().toISOString();
+    const profiles = enabled
+      ? (
+          activeDemoDb
+            .prepare(
+              `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
+               FROM users
+               WHERE isDemo = 1
+               ORDER BY CASE WHEN role = 'bibliothecaire' THEN 1 ELSE 0 END, isAdmin ASC, createdAt ASC`
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map(mapUserPublicRow)
+      : [];
+    const outbox = enabled ? demoService.getSimulatedOutbox(50) : [];
+    const settings = demoService.getSettings();
+
+    return {
+      demoModeEnabled: enabled,
+      isDemoSession: Boolean(req.isDemoSession && enabled),
+      simulatedNow,
+      clockOffsetDays,
+      clockOffsetHours,
+      profiles,
+      outbox,
+      settings,
+    };
+  };
+
+  const { attachUser, requireAuth, requireLibrarian, requireAdmin } = createAuthMiddleware(
+    db,
+    activeDemoDb,
+    isDemoModeEnabled
+  );
   const usedStates = new Set<string>();
   const pendingHandoffs = new Map<
     string,
@@ -135,15 +244,15 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ ok: true });
   });
 
-  // --- Authentification Google Institutionnelle & SSO USMBA ---
+  // --- Authentification Google Institutionnelle & Inscription Académique ---
 
   app.get('/api/auth/google/status', (_req, res) => {
-    res.json(googleAuthAdapter.getStatus());
+    res.json(authAdapter.getStatus());
   });
 
   app.get('/api/auth/google/url', (_req, res) => {
-    if (!googleAuthAdapter.isConfigured()) {
-      const status = googleAuthAdapter.getStatus();
+    if (!authAdapter.isConfigured()) {
+      const status = authAdapter.getStatus();
       res.status(501).json({
         error: status.message,
         code: 'GOOGLE_OAUTH_NOT_CONFIGURED',
@@ -154,7 +263,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
     const state = createSignedOAuthState();
     const nonce = crypto.randomBytes(16).toString('hex');
-    const authorizationUrl = googleAuthAdapter.buildAuthorizationUrl(state, nonce);
+    const authorizationUrl = authAdapter.buildAuthorizationUrl(state, nonce);
     res.json({ authorizationUrl });
   });
 
@@ -198,16 +307,18 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
     try {
       const now = getNow();
-      const claims = await googleAuthAdapter.exchangeCodeForClaims(code);
-      const resolution = await googleAuthAdapter.resolveProvisionedUser(db, claims, now);
+      const claims = await authAdapter.exchangeCodeForClaims(code);
+      const resolution = await authAdapter.resolveProvisionedUser(db, claims, now, {
+        requireAcademicEmail: true,
+      });
 
-      setSessionCookie(req, res, resolution.user.id);
-      service.recordAuditLog(
+      setSessionCookie(req, res, resolution.user.id, false);
+      realService.recordAuditLog(
         resolution.user,
         'AUTH_GOOGLE_LOGIN',
         'user',
         resolution.user.id,
-        `Connexion Google OIDC vérifiée pour ${resolution.user.email} (statut EST Fès : ${resolution.user.studentStatus}).`,
+        `Connexion Google OIDC vérifiée pour ${resolution.user.email} (statut EST : ${resolution.user.studentStatus}, rôle : ${resolution.user.role}).`,
         now
       );
 
@@ -264,19 +375,19 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
     const row = db
       .prepare(
-        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, cne, filiere, authSource, isDemo, createdAt
+        `SELECT id, fullName, email, role, institution, studentStatus, accountStatus, emailVerified, isAdmin, cne, filiere, authSource, isDemo, createdAt
          FROM users WHERE id = ?`
       )
-      .get(entry.userId) as (UserPublic & { isDemo?: number | boolean }) | undefined;
+      .get(entry.userId) as Record<string, unknown> | undefined;
 
     if (!row) {
       res.status(404).json({ error: 'Compte introuvable.' });
       return;
     }
 
-    const user: UserPublic = { ...row, isDemo: Boolean(row.isDemo) };
-    setSessionCookie(req, res, user.id);
-    const eligibility = service.checkEligibility(user.id, getNow());
+    const user = mapUserPublicRow(row);
+    setSessionCookie(req, res, user.id, false);
+    const eligibility = realService.checkEligibility(user.id, getNow());
     res.json({
       authenticated: true,
       user,
@@ -285,24 +396,231 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     });
   });
 
+  app.post('/api/auth/google/firebase', async (req: Request, res: Response) => {
+    const { idToken, accessToken } = req.body as {
+      idToken?: string;
+      accessToken?: string | null;
+    };
+
+    if (!idToken && !accessToken) {
+      res.status(400).json({
+        error: 'Jeton d’authentification Google manquant.',
+        code: 'MISSING_GOOGLE_TOKEN',
+      });
+      return;
+    }
+
+    try {
+      const now = getNow();
+      const claims = await authAdapter.verifyFirebaseOrGoogleToken({
+        idToken,
+        accessToken,
+      });
+      const resolution = await authAdapter.resolveProvisionedUser(db, claims, now, {
+        requireAcademicEmail: true,
+      });
+
+      setSessionCookie(req, res, resolution.user.id, false);
+      realService.recordAuditLog(
+        resolution.user,
+        'AUTH_GOOGLE_LOGIN',
+        'user',
+        resolution.user.id,
+        `Connexion Gmail académique vérifiée pour ${resolution.user.email} (statut EST : ${resolution.user.studentStatus}, rôle : ${resolution.user.role}).`,
+        now
+      );
+
+      const eligibility = realService.checkEligibility(resolution.user.id, now);
+      res.json({
+        authenticated: true,
+        user: resolution.user,
+        eligibility,
+        requiresLibrarianValidation: resolution.requiresLibrarianValidation,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Impossible de vérifier votre compte Gmail académique.';
+      res.status(403).json({
+        error: message,
+        code: 'ACADEMIC_GOOGLE_AUTH_REJECTED',
+      });
+    }
+  });
+
   app.get('/api/auth/me', (req: AuthenticatedRequest, res) => {
-    const now = getNow();
-    service.processDeadlines(now);
+    const ctx = getContext(req);
+    ctx.service.processDeadlines(ctx.now);
     const user = req.user || null;
-    const eligibility = service.checkEligibility(user?.id, now);
+    const eligibility = ctx.service.checkEligibility(user?.id, ctx.now);
     const cookieReceived = hasSessionCookie(req);
     res.json({
       authenticated: Boolean(user),
       cookieReceived,
       user,
       eligibility,
-      googleAuth: googleAuthAdapter.getStatus(),
-      demoModeEnabled: process.env.DISABLE_DEMO_MODE !== 'true',
+      googleAuth: authAdapter.getStatus(),
+      demoModeEnabled: isDemoModeEnabled(),
+      isDemoSession: ctx.isDemo,
+      simulatedNow: ctx.isDemo ? ctx.now.toISOString() : undefined,
+      settings: ctx.service.getSettings(),
     });
   });
 
+  // Inscription publique avec adresse académique existante + code à usage unique (Diagramme 1)
+  app.post('/api/auth/register', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { fullName, email, password, filiere, cne, demoMode } = req.body as {
+        fullName?: string;
+        email?: string;
+        password?: string;
+        filiere?: string;
+        cne?: string;
+        demoMode?: boolean;
+      };
+
+      const useDemo = Boolean(demoMode || req.isDemoSession);
+      if (useDemo && !isDemoModeEnabled()) {
+        res.status(403).json({
+          error: 'Le mode de démonstration est désactivé dans cet environnement.',
+          code: 'DEMO_MODE_DISABLED',
+        });
+        return;
+      }
+
+      const targetService = useDemo ? demoService : realService;
+      const targetNow = useDemo ? getDemoNow() : getNow();
+
+      const { user, verificationCode, expiresAt } = targetService.registerAcademicCandidate(
+        {
+          fullName: fullName || '',
+          email: email || '',
+          password: password || '',
+          filiere: filiere || null,
+          cne: cne || null,
+        },
+        targetNow
+      );
+
+      let emailDispatched = false;
+      if (!useDemo && isSmtpConfigured()) {
+        try {
+          emailDispatched = await sendEmailViaSmtp({
+            to: user.email,
+            subject: 'BiblioEST — Code de vérification de votre adresse académique',
+            text: [
+              `Bonjour ${user.fullName},`,
+              '',
+              `Votre code à usage unique pour confirmer votre adresse académique est : ${verificationCode}`,
+              'Ce code est valable pendant 15 minutes.',
+              '',
+              'Remarque : la vérification de votre adresse e-mail ne valide pas automatiquement votre statut EST Fès ; celui-ci reste en attente jusqu’à validation par un bibliothécaire.',
+              '',
+              'La Bibliothèque BiblioEST · EST Fès (USMBA)',
+            ].join('\n'),
+          });
+        } catch (mailErr) {
+          console.error('Échec envoi OTP SMTP:', mailErr);
+        }
+      }
+
+      res.status(201).json({
+        user,
+        emailVerificationRequired: true,
+        expiresAt,
+        emailDispatched: useDemo ? false : emailDispatched,
+        ...(useDemo ? { demoVerificationCode: verificationCode } : {}),
+        message: useDemo
+          ? `Compte démo créé pour ${user.email}. Un code à usage unique a été déposé dans le journal des notifications simulées.`
+          : emailDispatched
+            ? `Un code à usage unique a été envoyé à ${user.email}. Après validation de l’adresse, votre statut EST Fès restera en attente de validation par la bibliothèque.`
+            : `Inscription enregistrée pour ${user.email}. Validez le code à usage unique envoyé à votre adresse académique (le statut EST Fès restera en attente jusqu’à validation par la bibliothèque).`,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/verify-email', (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { email, code, demoMode } = req.body as {
+        email?: string;
+        code?: string;
+        demoMode?: boolean;
+      };
+      const useDemo = Boolean(demoMode || req.isDemoSession);
+      if (useDemo && !isDemoModeEnabled()) {
+        res.status(403).json({
+          error: 'Le mode de démonstration est désactivé.',
+          code: 'DEMO_MODE_DISABLED',
+        });
+        return;
+      }
+
+      const targetService = useDemo ? demoService : realService;
+      const targetNow = useDemo ? getDemoNow() : getNow();
+      const user = targetService.verifyEmailCode(email || '', code || '', targetNow);
+      setSessionCookie(req, res, user.id, useDemo);
+      const eligibility = targetService.checkEligibility(user.id, targetNow);
+
+      res.json({
+        authenticated: true,
+        user,
+        eligibility,
+        isDemoSession: useDemo,
+        message:
+          user.studentStatus === 'verifie'
+            ? 'Adresse e-mail vérifiée et dossier EST Fès actif.'
+            : 'Adresse e-mail vérifiée. Votre statut EST Fès reste en attente de validation par un bibliothécaire.',
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/resend-verification', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { email, demoMode } = req.body as { email?: string; demoMode?: boolean };
+      const useDemo = Boolean(demoMode || req.isDemoSession);
+      if (useDemo && !isDemoModeEnabled()) {
+        res.status(403).json({
+          error: 'Le mode de démonstration est désactivé.',
+          code: 'DEMO_MODE_DISABLED',
+        });
+        return;
+      }
+
+      const targetService = useDemo ? demoService : realService;
+      const targetNow = useDemo ? getDemoNow() : getNow();
+      const { email: targetEmail, verificationCode, expiresAt } =
+        targetService.resendVerificationCode(email || '', targetNow);
+
+      if (!useDemo && isSmtpConfigured()) {
+        try {
+          await sendEmailViaSmtp({
+            to: targetEmail,
+            subject: 'BiblioEST — Nouveau code de vérification',
+            text: `Votre nouveau code à usage unique est : ${verificationCode} (valable 15 minutes).`,
+          });
+        } catch (mailErr) {
+          console.error('Échec renvoi OTP SMTP:', mailErr);
+        }
+      }
+
+      res.json({
+        ok: true,
+        email: targetEmail,
+        expiresAt,
+        ...(useDemo ? { demoVerificationCode: verificationCode } : {}),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.post('/api/auth/demo-login', (req: Request, res: Response) => {
-    if (process.env.DISABLE_DEMO_MODE === 'true') {
+    if (!isDemoModeEnabled()) {
       res.status(403).json({
         error: 'Les comptes de démonstration sont désactivés dans cet environnement.',
         code: 'DEMO_MODE_DISABLED',
@@ -313,13 +631,13 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     const { userId, email } = req.body as { userId?: string; email?: string };
     const row = (
       userId
-        ? db.prepare(`SELECT * FROM users WHERE id = ? AND isDemo = 1`).get(userId.trim())
+        ? activeDemoDb.prepare(`SELECT * FROM users WHERE id = ? AND isDemo = 1`).get(userId.trim())
         : email
-          ? db
+          ? activeDemoDb
               .prepare(`SELECT * FROM users WHERE LOWER(email) = LOWER(?) AND isDemo = 1`)
               .get(email.trim())
           : undefined
-    ) as (UserPublic & { passwordHash: string; isDemo?: number }) | undefined;
+    ) as (Record<string, unknown> & { passwordHash: string }) | undefined;
 
     if (!row) {
       res.status(404).json({
@@ -329,12 +647,11 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       return;
     }
 
-    const { passwordHash: _ignored, isDemo, ...userBase } = row;
-    const userPublic: UserPublic = { ...userBase, isDemo: Boolean(isDemo) };
-    const now = getNow();
-    setSessionCookie(req, res, userPublic.id);
-    const eligibility = service.checkEligibility(userPublic.id, now);
-    service.recordAuditLog(
+    const userPublic = mapUserPublicRow(row);
+    const now = getDemoNow();
+    setSessionCookie(req, res, userPublic.id, true);
+    const eligibility = demoService.checkEligibility(userPublic.id, now);
+    demoService.recordAuditLog(
       userPublic,
       'AUTH_DEMO_LOGIN',
       'user',
@@ -342,7 +659,13 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       `Connexion via compte fictif d’évaluation (${userPublic.email}).`,
       now
     );
-    res.json({ authenticated: true, user: userPublic, eligibility });
+    res.json({
+      authenticated: true,
+      user: userPublic,
+      eligibility,
+      isDemoSession: true,
+      simulatedNow: now.toISOString(),
+    });
   });
 
   app.post('/api/auth/login', (req: Request, res: Response) => {
@@ -352,58 +675,66 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
       return;
     }
 
-    const row = db
+    const normalizedEmail = email.trim();
+    const realRow = db
       .prepare(`SELECT * FROM users WHERE LOWER(email) = LOWER(?)`)
-      .get(email.trim()) as (UserPublic & { passwordHash: string; isDemo?: number }) | undefined;
+      .get(normalizedEmail) as (Record<string, unknown> & { passwordHash: string }) | undefined;
 
-    if (row && (!Boolean(row.isDemo) || row.authSource === 'google_oidc')) {
+    const demoRow =
+      isDemoModeEnabled() && activeDemoDb !== db
+        ? (activeDemoDb
+            .prepare(`SELECT * FROM users WHERE LOWER(email) = LOWER(?) AND isDemo = 1`)
+            .get(normalizedEmail) as (Record<string, unknown> & { passwordHash: string }) | undefined)
+        : undefined;
+
+    const row = realRow || demoRow;
+    const isDemoAccount = Boolean(demoRow && !realRow) || Boolean(row?.isDemo);
+
+    if (row && (row.authSource === 'google_oidc' || String(row.passwordHash).startsWith('google_oidc:'))) {
       res.status(403).json({
         error:
-          'Les comptes institutionnels s’authentifient exclusivement via le bouton « Se connecter avec Google ». Aucun mot de passe Google ne doit être saisi ici.',
+          'Les comptes Google institutionnels s’authentifient exclusivement via le bouton « Se connecter avec Gmail académique ».',
         code: 'GOOGLE_OAUTH_REQUIRED',
       });
       return;
     }
 
-    if (process.env.DISABLE_DEMO_MODE === 'true') {
+    if (isDemoAccount && !isDemoModeEnabled()) {
       res.status(403).json({
         error:
-          'L’authentification locale de démonstration est désactivée. Utilisez le bouton « Se connecter avec Google ».',
+          'L’authentification de démonstration est désactivée dans cet environnement.',
         code: 'DEMO_MODE_DISABLED',
       });
       return;
     }
 
-    const passwordValid = row ? verifyPassword(password, row.passwordHash) : false;
+    const passwordValid = row ? verifyPassword(password, String(row.passwordHash)) : false;
     if (!row || !passwordValid) {
       res.status(401).json({
-        error: 'Identifiants de démonstration invalides.',
+        error: 'Identifiants invalides.',
         code: 'INVALID_CREDENTIALS',
       });
       return;
     }
 
-    const { passwordHash: _ignored, isDemo, ...userBase } = row;
-    const userPublic: UserPublic = { ...userBase, isDemo: Boolean(isDemo) };
-    const now = getNow();
-    setSessionCookie(req, res, userPublic.id);
-    const eligibility = service.checkEligibility(userPublic.id, now);
-    service.recordAuditLog(
+    const userPublic = mapUserPublicRow(row);
+    const targetService = isDemoAccount ? demoService : realService;
+    const now = isDemoAccount ? getDemoNow() : getNow();
+    setSessionCookie(req, res, userPublic.id, isDemoAccount);
+    const eligibility = targetService.checkEligibility(userPublic.id, now);
+    targetService.recordAuditLog(
       userPublic,
-      'AUTH_DEMO_LOGIN',
+      isDemoAccount ? 'AUTH_DEMO_LOGIN' : 'AUTH_LOCAL_LOGIN',
       'user',
       userPublic.id,
-      `Connexion via compte fictif d’évaluation (${userPublic.email}).`,
+      `Connexion par mot de passe pour ${userPublic.email}.`,
       now
     );
-    res.json({ authenticated: true, user: userPublic, eligibility });
-  });
-
-  app.post('/api/auth/register', (_req: Request, res: Response) => {
-    res.status(403).json({
-      error:
-        'Les comptes académiques sont fournis et administrés par l’école. La création autonome de compte ou d’adresse académique est désactivée.',
-      code: 'SELF_REGISTRATION_DISABLED',
+    res.json({
+      authenticated: true,
+      user: userPublic,
+      eligibility,
+      isDemoSession: isDemoAccount,
     });
   });
 
@@ -413,10 +744,83 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ ok: true });
   });
 
+  // --- Bac à sable Mode Démo (isolé des données réelles et des vrais envois d'e-mails) ---
+
+  app.get('/api/demo/state', (req: AuthenticatedRequest, res: Response) => {
+    if (!isDemoModeEnabled()) {
+      res.status(403).json({
+        error: 'Le mode de démonstration est désactivé en production.',
+        code: 'DEMO_MODE_DISABLED',
+      });
+      return;
+    }
+    demoService.processDeadlines(getDemoNow());
+    res.json(buildDemoState(req));
+  });
+
+  app.post('/api/demo/reset', (req: AuthenticatedRequest, res: Response) => {
+    if (!isDemoModeEnabled()) {
+      res.status(403).json({
+        error: 'Le mode de démonstration est désactivé en production.',
+        code: 'DEMO_MODE_DISABLED',
+      });
+      return;
+    }
+    resetDemoDatabase(activeDemoDb, getNow());
+    demoService.processDeadlines(getDemoNow());
+    res.json(buildDemoState(req));
+  });
+
+  app.post('/api/demo/clock', (req: AuthenticatedRequest, res: Response) => {
+    if (!isDemoModeEnabled()) {
+      res.status(403).json({
+        error: 'Le mode de démonstration est désactivé en production.',
+        code: 'DEMO_MODE_DISABLED',
+      });
+      return;
+    }
+
+    const { addDays, setOffsetDays, addHours, setOffsetHours } = req.body as {
+      addDays?: number;
+      setOffsetDays?: number;
+      addHours?: number;
+      setOffsetHours?: number;
+    };
+
+    const currentHours = getDemoClockOffsetHours();
+    let nextHours = currentHours;
+    if (typeof setOffsetHours === 'number' && Number.isFinite(setOffsetHours)) {
+      nextHours = Math.max(-30 * 24, Math.min(365 * 24, setOffsetHours));
+    } else if (typeof addHours === 'number' && Number.isFinite(addHours)) {
+      nextHours = Math.max(-30 * 24, Math.min(365 * 24, currentHours + addHours));
+    } else if (typeof setOffsetDays === 'number' && Number.isFinite(setOffsetDays)) {
+      nextHours = Math.max(-30 * 24, Math.min(365 * 24, setOffsetDays * 24));
+    } else if (typeof addDays === 'number' && Number.isFinite(addDays)) {
+      nextHours = Math.max(-30 * 24, Math.min(365 * 24, currentHours + addDays * 24));
+    } else {
+      res.status(400).json({ error: 'Paramètre addHours, addDays, setOffsetHours ou setOffsetDays requis.' });
+      return;
+    }
+
+    activeDemoDb
+      .prepare(`INSERT OR REPLACE INTO demo_meta (key, value) VALUES ('clock_offset_hours', ?)`)
+      .run(String(nextHours));
+    activeDemoDb
+      .prepare(`INSERT OR REPLACE INTO demo_meta (key, value) VALUES ('clock_offset_days', ?)`)
+      .run(String(Number((nextHours / 24).toFixed(2))));
+
+    const expiredReservationsCount = demoService.processDeadlines(getDemoNow());
+    res.json({
+      ...buildDemoState(req),
+      expiredReservationsCount,
+    });
+  });
+
   // --- Catalogue public & consultation ---
 
-  app.get('/api/books', (req, res) => {
-    service.processDeadlines(getNow());
+  app.get('/api/books', (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    ctx.service.processDeadlines(ctx.now);
     const search = typeof req.query.search === 'string' ? req.query.search : undefined;
     const category = typeof req.query.category === 'string' ? req.query.category : undefined;
     const language = typeof req.query.language === 'string' ? req.query.language : undefined;
@@ -424,7 +828,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     const year = Number.isFinite(yearRaw) && yearRaw > 0 ? yearRaw : null;
     const availableOnly = req.query.availableOnly === 'true';
 
-    const books = service.listBooks({
+    const books = ctx.service.listBooks({
       search,
       category,
       language,
@@ -435,9 +839,13 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     res.json({ books });
   });
 
-  app.get('/api/books/:id', (req, res, next) => {
+  app.get('/api/books/:id', (req: AuthenticatedRequest, res, next) => {
     try {
-      const detail = service.getBookDetail(req.params.id, getNow());
+      const ctx = getContext(req);
+      const isLibrarian = req.user?.role === 'bibliothecaire';
+      const detail = ctx.service.getBookDetail(String(req.params.id), ctx.now, {
+        includeCopies: isLibrarian,
+      });
       res.json({ book: detail });
     } catch (err) {
       next(err);
@@ -448,7 +856,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/books/:id/borrow', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
-      const loan = service.borrowBook(req.user!.id, String(req.params.id), getNow());
+      const ctx = getContext(req);
+      const loan = ctx.service.borrowBook(req.user!.id, String(req.params.id), ctx.now);
       res.status(201).json({ loan });
     } catch (err) {
       next(err);
@@ -457,7 +866,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/books/:id/reserve', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
-      const reservation = service.reserveBook(req.user!.id, String(req.params.id), getNow());
+      const ctx = getContext(req);
+      const reservation = ctx.service.reserveBook(req.user!.id, String(req.params.id), ctx.now);
       res.status(201).json({
         reservation,
         message:
@@ -469,21 +879,24 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
   });
 
   app.get('/api/loans/mine', requireAuth, (req: AuthenticatedRequest, res) => {
-    const loans = service.getMemberLoans(req.user!.id, getNow());
+    const ctx = getContext(req);
+    const loans = ctx.service.getMemberLoans(req.user!.id, ctx.now);
     res.json({ loans });
   });
 
   app.get('/api/reservations/mine', requireAuth, (req: AuthenticatedRequest, res) => {
-    const reservations = service.getMemberReservations(req.user!.id, getNow());
+    const ctx = getContext(req);
+    const reservations = ctx.service.getMemberReservations(req.user!.id, ctx.now);
     res.json({ reservations });
   });
 
   app.post('/api/reservations/:id/cancel', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
-      const reservation = service.cancelReservation(
+      const ctx = getContext(req);
+      const reservation = ctx.service.cancelReservation(
         String(req.params.id),
         req.user!,
-        getNow()
+        ctx.now
       );
       res.json({ reservation });
     } catch (err) {
@@ -492,39 +905,44 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
   });
 
   app.get('/api/notifications/mine', requireAuth, (req: AuthenticatedRequest, res) => {
-    const notifications = service.getMemberNotifications(req.user!.id);
+    const ctx = getContext(req);
+    const notifications = ctx.service.getMemberNotifications(req.user!.id);
     res.json({ notifications });
   });
 
   app.post('/api/notifications/:id/read', requireAuth, (req: AuthenticatedRequest, res) => {
-    service.markNotificationRead(String(req.params.id), req.user!.id, getNow());
+    const ctx = getContext(req);
+    ctx.service.markNotificationRead(String(req.params.id), req.user!.id, ctx.now);
     res.json({ ok: true });
   });
 
   app.post('/api/notifications/read-all', requireAuth, (req: AuthenticatedRequest, res) => {
-    service.markAllNotificationsRead(req.user!.id, getNow());
+    const ctx = getContext(req);
+    ctx.service.markAllNotificationsRead(req.user!.id, ctx.now);
     res.json({ ok: true });
   });
 
   // --- Panier de demandes (ne réserve jamais d'exemplaire avant confirmation serveur) ---
 
   app.get('/api/cart', requireAuth, (req: AuthenticatedRequest, res) => {
-    const items = service.getCart(req.user!.id, getNow());
+    const ctx = getContext(req);
+    const items = ctx.service.getCart(req.user!.id, ctx.now);
     res.json({ items, maxQuantityPerTitle: MAX_QUANTITY_PER_TITLE });
   });
 
   app.post('/api/cart/items', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { bookId, quantity } = req.body as { bookId?: string; quantity?: number };
       if (!bookId) {
         res.status(400).json({ error: 'Identifiant d’ouvrage requis.' });
         return;
       }
-      const items = service.addToCart(
+      const items = ctx.service.addToCart(
         req.user!.id,
         bookId,
         quantity === undefined ? 1 : Number(quantity),
-        getNow()
+        ctx.now
       );
       res.status(201).json({ items });
     } catch (err) {
@@ -534,16 +952,17 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.patch('/api/cart/items/:bookId', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { quantity } = req.body as { quantity?: number };
       if (quantity === undefined) {
         res.status(400).json({ error: 'Quantité requise.' });
         return;
       }
-      const items = service.updateCartItemQuantity(
+      const items = ctx.service.updateCartItemQuantity(
         req.user!.id,
         String(req.params.bookId),
         Number(quantity),
-        getNow()
+        ctx.now
       );
       res.json({ items });
     } catch (err) {
@@ -553,10 +972,11 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.delete('/api/cart/items/:bookId', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
-      const items = service.removeFromCart(
+      const ctx = getContext(req);
+      const items = ctx.service.removeFromCart(
         req.user!.id,
         String(req.params.bookId),
-        getNow()
+        ctx.now
       );
       res.json({ items });
     } catch (err) {
@@ -566,7 +986,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/cart/confirm', requireAuth, (req: AuthenticatedRequest, res, next) => {
     try {
-      const confirmation = service.confirmCart(req.user!.id, getNow());
+      const ctx = getContext(req);
+      const confirmation = ctx.service.confirmCart(req.user!.id, ctx.now);
       res.json(confirmation);
     } catch (err) {
       next(err);
@@ -575,17 +996,20 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   // --- Espace Bibliothécaire (strictement protégé par requireLibrarian) ---
 
-  app.get('/api/admin/stats', requireLibrarian, (_req, res) => {
-    res.json({ stats: service.getDashboardStats(getNow()) });
+  app.get('/api/admin/stats', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    res.json({ stats: ctx.service.getDashboardStats(ctx.now) });
   });
 
-  app.get('/api/admin/books', requireLibrarian, (_req, res) => {
-    const books = service.listBooks({ includeArchived: true });
+  app.get('/api/admin/books', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    const books = ctx.service.listBooks({ includeArchived: true });
     res.json({ books });
   });
 
   app.post('/api/admin/books', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const {
         title,
         authors,
@@ -608,7 +1032,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         return;
       }
 
-      const book = service.createBook(
+      const book = ctx.service.createBook(
         {
           title,
           authors,
@@ -623,7 +1047,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
           shelfLocation,
           featured: Boolean(featured),
         },
-        getNow(),
+        ctx.now,
         req.user!
       );
       res.status(201).json({ book });
@@ -634,19 +1058,22 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.patch('/api/admin/books/:id', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
-      const book = service.updateBook(String(req.params.id), req.body, req.user!, getNow());
+      const ctx = getContext(req);
+      const book = ctx.service.updateBook(String(req.params.id), req.body, req.user!, ctx.now);
       res.json({ book });
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/admin/copies', requireLibrarian, (_req, res) => {
-    res.json({ copies: service.getAllCopiesAdmin() });
+  app.get('/api/admin/copies', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    res.json({ copies: ctx.service.getAllCopiesAdmin() });
   });
 
   app.post('/api/admin/books/:id/copies', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { barcode, physicalCondition, location } = req.body as {
         barcode?: string;
         physicalCondition?: PhysicalCondition;
@@ -658,10 +1085,47 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         });
         return;
       }
-      const result = service.registerCopy(
+      const result = ctx.service.registerCopy(
         String(req.params.id),
         { barcode, physicalCondition, location },
-        getNow(),
+        ctx.now,
+        req.user!
+      );
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/books/:id/copies/batch', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const { barcodes, physicalCondition, location } = req.body as {
+        barcodes?: string[] | string;
+        physicalCondition?: PhysicalCondition;
+        location?: string;
+      };
+      const barcodeList = Array.isArray(barcodes)
+        ? barcodes
+        : typeof barcodes === 'string'
+          ? barcodes.split(/[\n,;]+/g)
+          : [];
+
+      if (barcodeList.length === 0 || !physicalCondition || !location) {
+        res.status(400).json({
+          error: 'Liste de codes-barres, état physique et emplacement sont obligatoires.',
+        });
+        return;
+      }
+
+      const result = ctx.service.registerCopiesBatch(
+        String(req.params.id),
+        {
+          barcodes: barcodeList,
+          physicalCondition,
+          location,
+        },
+        ctx.now,
         req.user!
       );
       res.status(201).json(result);
@@ -672,6 +1136,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.patch('/api/admin/copies/:id', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { status, physicalCondition, location } = req.body as {
         status?: CopyStatus;
         physicalCondition?: PhysicalCondition;
@@ -683,12 +1148,12 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         });
         return;
       }
-      const copy = service.updateCopyStatusAdmin(
+      const copy = ctx.service.updateCopyStatusAdmin(
         String(req.params.id),
         status,
         physicalCondition,
         location,
-        getNow(),
+        ctx.now,
         req.user!
       );
       res.json({ copy });
@@ -699,7 +1164,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/admin/copies/:id/complete-repair', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
-      const copy = service.completeCopyRepair(String(req.params.id), req.user!, getNow());
+      const ctx = getContext(req);
+      const copy = ctx.service.completeCopyRepair(String(req.params.id), req.user!, ctx.now);
       res.json({ copy });
     } catch (err) {
       next(err);
@@ -708,6 +1174,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/admin/copies/:id/inspect', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { outcome, physicalCondition } = req.body as {
         outcome?: ReturnInspectionOutcome;
         physicalCondition?: PhysicalCondition;
@@ -718,11 +1185,11 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         });
         return;
       }
-      const result = service.inspectRepairedCopy(
+      const result = ctx.service.inspectRepairedCopy(
         String(req.params.id),
         outcome,
         physicalCondition,
-        getNow(),
+        ctx.now,
         req.user!
       );
       res.json(result);
@@ -731,12 +1198,14 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   });
 
-  app.get('/api/admin/loans', requireLibrarian, (_req, res) => {
-    res.json({ loans: service.getAllLoansAdmin(getNow()) });
+  app.get('/api/admin/loans', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    res.json({ loans: ctx.service.getAllLoansAdmin(ctx.now) });
   });
 
   app.post('/api/admin/loans', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { memberId, bookId, copyId } = req.body as {
         memberId?: string;
         bookId?: string;
@@ -746,8 +1215,18 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         res.status(400).json({ error: 'Membre et ouvrage requis pour enregistrer un prêt.' });
         return;
       }
-      const loan = service.createLoanAdmin(memberId, bookId, copyId || null, req.user!, getNow());
+      const loan = ctx.service.createLoanAdmin(memberId, bookId, copyId || null, req.user!, ctx.now);
       res.status(201).json({ loan });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/loans/:id/toggle-overdue-test', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const loan = ctx.service.toggleLoanOverdueTest(String(req.params.id), req.user!, ctx.now);
+      res.json({ loan });
     } catch (err) {
       next(err);
     }
@@ -755,6 +1234,7 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/admin/loans/:id/return', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { outcome, physicalCondition, notes } = req.body as {
         outcome?: ReturnInspectionOutcome;
         physicalCondition?: PhysicalCondition;
@@ -766,12 +1246,12 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         });
         return;
       }
-      const result = service.returnLoan(
+      const result = ctx.service.returnLoan(
         String(req.params.id),
         outcome,
         physicalCondition,
         notes,
-        getNow(),
+        ctx.now,
         req.user!
       );
       res.json(result);
@@ -780,18 +1260,244 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   });
 
-  app.get('/api/admin/reservations', requireLibrarian, (_req, res) => {
-    res.json({ reservations: service.getAllReservationsAdmin(getNow()) });
+  app.post('/api/admin/loans/notify-overdue', requireLibrarian, async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const { googleAccessToken } = req.body as { googleAccessToken?: string };
+      const settings = ctx.service.getSettings();
+      const { overdueLoansCount, recipients } = ctx.service.notifyOverdueMembersAdmin(req.user!, ctx.now);
+      const smtpConfigured = !ctx.isDemo && isSmtpConfigured();
+      const subject = 'BiblioEST — Rappel : emprunt(s) en retard à restituer';
+
+      let emailsSentCount = 0;
+      let gmailApiUsed = false;
+
+      if (recipients.length > 0) {
+        for (const r of recipients) {
+          const listLines = r.books
+            .map(
+              (b) =>
+                `- ${b.title} (Code-barres : ${b.barcode}, échéance : ${new Date(b.dueAt).toLocaleDateString('fr-FR')})`
+            )
+            .join('\n');
+          const text = [
+            `Bonjour ${r.memberName},`,
+            '',
+            'Le délai de prêt pour les ouvrages suivants empruntés à la bibliothèque BiblioEST est dépassé :',
+            listLines,
+            '',
+            'Merci de restituer ces exemplaires à la bibliothèque BiblioEST (EST Fès - USMBA) dans les plus brefs délais afin de régulariser votre situation.',
+            '',
+            'Cordialement,',
+            'La Bibliothèque BiblioEST · EST Fès (USMBA)',
+          ].join('\n');
+
+          if (ctx.isDemo) {
+            ctx.service.recordSimulatedEmail(
+              {
+                recipientEmail: r.memberEmail,
+                subject,
+                body: text,
+                category: 'rappel_retard',
+              },
+              ctx.now
+            );
+            r.emailSent = true;
+            emailsSentCount += 1;
+            continue;
+          }
+
+          if (!settings.realEmailsEnabled) {
+            continue;
+          }
+
+          let sent = false;
+          if (googleAccessToken) {
+            try {
+              sent = await sendEmailViaGmailApi({
+                accessToken: googleAccessToken,
+                to: r.memberEmail,
+                subject,
+                text,
+              });
+              if (sent) {
+                gmailApiUsed = true;
+                r.emailSent = true;
+                emailsSentCount += 1;
+              }
+            } catch (gmailErr) {
+              console.error('Erreur envoi Gmail API pour', r.memberEmail, ':', gmailErr);
+            }
+          }
+
+          if (!sent && smtpConfigured) {
+            try {
+              sent = await sendEmailViaSmtp({ to: r.memberEmail, subject, text });
+              if (sent) {
+                r.emailSent = true;
+                emailsSentCount += 1;
+              }
+            } catch (mailErr) {
+              console.error('Échec envoi SMTP rappel retard pour', r.memberEmail, ':', mailErr);
+            }
+          }
+        }
+      }
+
+      let summaryMessage = 'Aucun emprunt en retard à notifier.';
+      if (recipients.length > 0) {
+        if (ctx.isDemo) {
+          summaryMessage = `Mode Démo : ${emailsSentCount} e-mail(s) simulé(s) enregistré(s) dans le journal de démonstration (aucun vrai e-mail envoyé).`;
+        } else if (!settings.realEmailsEnabled) {
+          summaryMessage = `Notifications internes enregistrées pour ${recipients.length} membre(s). L’envoi réel d’e-mails est désactivé dans les paramètres.`;
+        } else if (gmailApiUsed && emailsSentCount > 0) {
+          summaryMessage = `${emailsSentCount}/${recipients.length} e-mail(s) de rappel envoyé(s) avec succès via Gmail à ${recipients.map((r) => r.memberEmail).join(', ')}.`;
+        } else if (smtpConfigured && emailsSentCount > 0) {
+          summaryMessage = `${emailsSentCount}/${recipients.length} e-mail(s) de rappel envoyé(s) via SMTP et notification(s) BiblioEST enregistrée(s).`;
+        } else {
+          summaryMessage = `Rappel enregistré dans BiblioEST pour ${recipients.length} membre(s). Connectez votre compte Gmail académique pour envoyer directement les e-mails.`;
+        }
+      }
+
+      const payload: OverdueNotificationResult = {
+        notifiedMembersCount: recipients.length,
+        overdueLoansCount,
+        emailsSentCount,
+        smtpConfigured,
+        gmailApiUsed,
+        demoSimulated: ctx.isDemo,
+        recipients,
+        subject,
+        summaryMessage,
+      };
+      res.json(payload);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/email/test', requireLibrarian, async (req: AuthenticatedRequest, res: Response) => {
+    const ctx = getContext(req);
+    const settings = ctx.service.getSettings();
+    const { googleAccessToken, recipientEmail } = req.body as {
+      googleAccessToken?: string;
+      recipientEmail?: string;
+    };
+
+    if (
+      recipientEmail &&
+      recipientEmail.trim().toLowerCase() !== settings.testEmailRecipient.trim().toLowerCase()
+    ) {
+      res.status(403).json({
+        error: `Le bouton de test d’e-mail est strictement limité à l’adresse de test configurée (${settings.testEmailRecipient}).`,
+        code: 'TEST_EMAIL_RECIPIENT_RESTRICTED',
+      });
+      return;
+    }
+
+    const targetRecipient = settings.testEmailRecipient;
+    const subject = 'BiblioEST — Message de test de notification';
+    const body = [
+      'Ceci est un e-mail de test envoyé depuis l’espace d’administration BiblioEST.',
+      `Destinataire autorisé : ${targetRecipient}`,
+      `Date : ${ctx.now.toISOString()}`,
+    ].join('\n');
+
+    if (ctx.isDemo) {
+      const record = ctx.service.recordSimulatedEmail(
+        {
+          recipientEmail: targetRecipient,
+          subject,
+          body,
+          category: 'test',
+        },
+        ctx.now
+      );
+      res.json({
+        ok: true,
+        demoSimulated: true,
+        recipientEmail: targetRecipient,
+        record,
+        message: `Mode Démo : e-mail de test enregistré dans le journal simulé pour ${targetRecipient} (aucun vrai e-mail envoyé).`,
+      });
+      return;
+    }
+
+    if (!settings.realEmailsEnabled) {
+      res.status(409).json({
+        error: 'L’envoi réel d’e-mails est désactivé dans les paramètres de la bibliothèque.',
+        code: 'REAL_EMAILS_DISABLED',
+      });
+      return;
+    }
+
+    let sent = false;
+    let transport: 'gmail_api' | 'smtp' | 'none' = 'none';
+
+    if (googleAccessToken) {
+      try {
+        sent = await sendEmailViaGmailApi({
+          accessToken: googleAccessToken,
+          to: targetRecipient,
+          subject,
+          text: body,
+        });
+        if (sent) transport = 'gmail_api';
+      } catch (err) {
+        console.error('Échec test Gmail API:', err);
+      }
+    }
+
+    if (!sent && isSmtpConfigured()) {
+      try {
+        sent = await sendEmailViaSmtp({ to: targetRecipient, subject, text: body });
+        if (sent) transport = 'smtp';
+      } catch (err) {
+        console.error('Échec test SMTP:', err);
+      }
+    }
+
+    ctx.service.recordAuditLog(
+      req.user,
+      'ADMIN_TEST_EMAIL',
+      'settings',
+      'default',
+      `Test d'e-mail vers ${targetRecipient} (${sent ? `envoyé via ${transport}` : 'non expédié'}).`,
+      ctx.now
+    );
+
+    if (!sent) {
+      res.status(503).json({
+        error: `Aucun transport actif (Gmail API ou SMTP) pour expédier vers ${targetRecipient}. Connectez Gmail ou configurez SMTP.`,
+        code: 'EMAIL_TRANSPORT_UNAVAILABLE',
+        recipientEmail: targetRecipient,
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      demoSimulated: false,
+      recipientEmail: targetRecipient,
+      transport,
+      message: `E-mail de test envoyé à l’adresse configurée (${targetRecipient}) via ${transport === 'gmail_api' ? 'Gmail API' : 'SMTP'}.`,
+    });
+  });
+
+  app.get('/api/admin/reservations', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    res.json({ reservations: ctx.service.getAllReservationsAdmin(ctx.now) });
   });
 
   app.post('/api/admin/reservations/allocate', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { bookId } = req.body as { bookId?: string };
       if (!bookId) {
         res.status(400).json({ error: 'Identifiant d’ouvrage requis.' });
         return;
       }
-      const result = service.allocateAvailableCopyToQueueAdmin(bookId, req.user!, getNow());
+      const result = ctx.service.allocateAvailableCopyToQueueAdmin(bookId, req.user!, ctx.now);
       res.json(result);
     } catch (err) {
       next(err);
@@ -803,10 +1509,11 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     requireLibrarian,
     (req: AuthenticatedRequest, res, next) => {
       try {
-        const reservation = service.confirmReservationAvailability(
+        const ctx = getContext(req);
+        const reservation = ctx.service.confirmReservationAvailability(
           String(req.params.id),
           req.user!,
-          getNow()
+          ctx.now
         );
         res.json({ reservation });
       } catch (err) {
@@ -817,7 +1524,8 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
 
   app.post('/api/admin/reservations/:id/pickup', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
-      const loan = service.fulfillReservationPickup(String(req.params.id), getNow(), req.user!);
+      const ctx = getContext(req);
+      const loan = ctx.service.fulfillReservationPickup(String(req.params.id), ctx.now, req.user!);
       res.json({ loan });
     } catch (err) {
       next(err);
@@ -829,10 +1537,11 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     requireLibrarian,
     (req: AuthenticatedRequest, res, next) => {
       try {
-        const reservation = service.cancelReservation(
+        const ctx = getContext(req);
+        const reservation = ctx.service.cancelReservation(
           String(req.params.id),
           req.user!,
-          getNow()
+          ctx.now
         );
         res.json({ reservation });
       } catch (err) {
@@ -841,17 +1550,20 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   );
 
-  app.post('/api/admin/reservations/process-deadlines', requireLibrarian, (_req, res) => {
-    const expiredCount = service.processDeadlines(getNow());
+  app.post('/api/admin/reservations/process-deadlines', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    const expiredCount = ctx.service.processDeadlines(ctx.now);
     res.json({ expiredCount });
   });
 
-  app.get('/api/admin/members', requireLibrarian, (_req, res) => {
-    res.json({ members: service.listMembersAdmin() });
+  app.get('/api/admin/members', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    res.json({ members: ctx.service.listMembersAdmin() });
   });
 
   app.patch('/api/admin/members/:id/verification', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
     try {
+      const ctx = getContext(req);
       const { studentStatus, accountStatus } = req.body as {
         studentStatus?: StudentStatus;
         accountStatus?: AccountStatus;
@@ -860,12 +1572,12 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
         res.status(400).json({ error: 'studentStatus et accountStatus requis.' });
         return;
       }
-      const member = service.updateMemberVerificationAdmin(
+      const member = ctx.service.updateMemberVerificationAdmin(
         String(req.params.id),
         studentStatus,
         accountStatus,
         req.user!,
-        getNow()
+        ctx.now
       );
       res.json({ member });
     } catch (err) {
@@ -873,10 +1585,106 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     }
   });
 
-  app.get('/api/admin/audit-logs', requireLibrarian, (req, res) => {
+  // --- Routes Administrateur de la bibliothèque (Diagramme 1) ---
+
+  app.patch('/api/admin/members/:id/role', requireAdmin, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const { role, isAdmin } = req.body as { role?: UserRole; isAdmin?: boolean };
+      if (role !== 'membre' && role !== 'bibliothecaire') {
+        res.status(400).json({ error: 'Rôle invalide (membre ou bibliothecaire attendu).' });
+        return;
+      }
+      const member = ctx.service.updateStaffRoleAdmin(
+        String(req.params.id),
+        role,
+        Boolean(isAdmin),
+        req.user!,
+        ctx.now
+      );
+      res.json({ member });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/admin/settings', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    res.json({ settings: ctx.service.getSettings() });
+  });
+
+  app.patch('/api/admin/settings', requireAdmin, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const patch = req.body as Partial<LibrarySettings>;
+      const settings = ctx.service.updateSettings(patch, req.user!, ctx.now);
+      res.json({ settings });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // --- Comptoir & Circulation (scan carte membre & code-barres exemplaire, réservé au personnel) ---
+
+  app.get('/api/admin/counter/members/search', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    res.json({ members: ctx.service.searchMembersAtCounter(q) });
+  });
+
+  app.get('/api/admin/counter/member', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const q = typeof req.query.q === 'string' ? req.query.q : '';
+      const dossier = ctx.service.lookupMemberAtCounter(q, ctx.now);
+      res.json({ dossier });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/counter/checkout', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const { memberId, barcode } = req.body as { memberId?: string; barcode?: string };
+      if (!memberId || !barcode) {
+        res.status(400).json({ error: 'Identifiant du membre et code-barres de l’exemplaire requis.' });
+        return;
+      }
+      const result = ctx.service.checkoutCopyAtCounter(memberId, barcode, req.user!, ctx.now);
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/counter/scan-return', requireLibrarian, (req: AuthenticatedRequest, res, next) => {
+    try {
+      const ctx = getContext(req);
+      const { barcode } = req.body as { barcode?: string };
+      if (!barcode) {
+        res.status(400).json({ error: 'Code-barres de l’exemplaire requis.' });
+        return;
+      }
+      const lookup = ctx.service.lookupCopyForReturnAtCounter(barcode, ctx.now);
+      res.json(lookup);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/admin/copy-state-logs', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
     const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 100;
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 100;
-    res.json({ logs: service.getAuditLogsAdmin(limit) });
+    res.json({ logs: ctx.service.getCopyStateLogsAdmin(limit) });
+  });
+
+  app.get('/api/admin/audit-logs', requireLibrarian, (req: AuthenticatedRequest, res) => {
+    const ctx = getContext(req);
+    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 100;
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 100;
+    res.json({ logs: ctx.service.getAuditLogsAdmin(limit) });
   });
 
   // Gestion centralisée des erreurs métier
@@ -891,5 +1699,5 @@ export function createApp(db: Database.Database, getNow: () => Date = () => new 
     });
   });
 
-  return { app, service };
+  return { app, service: realService, demoService };
 }
